@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+a {
+  color: inherit;
+}

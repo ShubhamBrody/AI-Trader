@@ -1,0 +1,8 @@
+# Optional deep-learning dependencies (GPU-enabled) for Windows/NVIDIA.
+#
+# This uses the official PyTorch CUDA wheel index. If you need a different CUDA build,
+# update the index-url using the selector on https://pytorch.org/get-started/locally/.
+
+--index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.2

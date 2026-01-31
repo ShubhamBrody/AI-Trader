@@ -1,0 +1,4 @@
+timezone: Asia/Kolkata
+market_hours:
+  open: "09:15"
+  close: "15:29"
