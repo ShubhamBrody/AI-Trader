@@ -7,6 +7,9 @@ export type IntradayOverlayAnalysis = {
   asof_ts: number | null;
   n: number;
   atr?: number;
+  // Backward-compatible fields used by older UI components.
+  candle_patterns?: any[];
+  winner_strategy?: any;
   trend?: {
     dir: 'up' | 'down' | 'flat';
     slope?: number;
@@ -24,6 +27,7 @@ export type IntradayOverlayAnalysis = {
     entry: number;
     stop: number;
     target: number;
+    pattern_hint?: string;
     confidence?: number;
     model_confidence?: number;
     risk_profile?: 'conservative' | 'normal' | 'aggressive';

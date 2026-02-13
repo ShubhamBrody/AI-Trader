@@ -7,7 +7,14 @@ type StreamState = {
   error: string | null;
 };
 
-export function useCandleStream(enabled: boolean) {
+type CandleStreamOptions = {
+  instrument_key?: string;
+  interval?: string;
+  lookback_minutes?: number;
+  poll_seconds?: number;
+};
+
+export function useCandleStream(enabled: boolean, opts?: CandleStreamOptions) {
   const [state, setState] = useState<StreamState>({
     connected: false,
     lastMessageAt: null,
@@ -18,7 +25,15 @@ export function useCandleStream(enabled: boolean) {
   const wsRef = useRef<WebSocket | null>(null);
   const pingRef = useRef<number | null>(null);
 
-  const url = useMemo(() => wsUrl('/api/ws/candles'), []);
+  const url = useMemo(() => {
+    const params = new URLSearchParams();
+    if (opts?.instrument_key) params.set('instrument_key', opts.instrument_key);
+    if (opts?.interval) params.set('interval', opts.interval);
+    if (typeof opts?.lookback_minutes === 'number') params.set('lookback_minutes', String(opts.lookback_minutes));
+    if (typeof opts?.poll_seconds === 'number') params.set('poll_seconds', String(opts.poll_seconds));
+    const qs = params.toString();
+    return wsUrl(`/api/ws/candles${qs ? `?${qs}` : ''}`);
+  }, [opts?.instrument_key, opts?.interval, opts?.lookback_minutes, opts?.poll_seconds]);
 
   useEffect(() => {
     if (!enabled) return;

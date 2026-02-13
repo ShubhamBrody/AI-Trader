@@ -6,6 +6,7 @@ import {
   type IPriceLine,
   type ISeriesApi,
   type UTCTimestamp,
+  type LogicalRange,
   ColorType,
   CrosshairMode,
   createChart,
@@ -29,6 +30,8 @@ export type CandleOverlays = {
   target?: number;
 };
 
+export type DraggableOverlayKey = 'stop_loss' | 'target';
+
 function toUtcTimestampSeconds(iso: string): UTCTimestamp {
   return Math.floor(new Date(iso).getTime() / 1000) as UTCTimestamp;
 }
@@ -50,16 +53,30 @@ export function CandlestickChart({
   candles,
   overlays,
   watermark,
+  draggable,
+  onDragEnd,
 }: {
   candles: Candle[];
   overlays?: CandleOverlays;
   watermark?: string;
+  draggable?: Partial<Record<DraggableOverlayKey, boolean>>;
+  onDragEnd?: (key: DraggableOverlayKey, price: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
+  const watermarkPluginRef = useRef<{ detach: () => void } | null>(null);
+  const didInitialFitRef = useRef(false);
+  const lastLogicalRangeRef = useRef<LogicalRange | null>(null);
+  const suppressRangeCaptureRef = useRef(false);
   const overlayLinesRef = useRef<IPriceLine[]>([]);
+  const namedLinesRef = useRef<Partial<Record<'entry' | 'stop_loss' | 'target', IPriceLine>>>({});
+
+  const dragStateRef = useRef<{
+    active: DraggableOverlayKey | null;
+    isDragging: boolean;
+  }>({ active: null, isDragging: false });
 
   const data = useMemo(() => {
     const sorted = (candles ?? [])
@@ -154,26 +171,19 @@ export function CandlestickChart({
       scaleMargins: { top: 0.8, bottom: 0 },
     });
 
-    const watermarkPlugin = watermark
-      ? createTextWatermark(chart.panes()[0], {
-          visible: true,
-          horzAlign: 'center',
-          vertAlign: 'center',
-          lines: [
-            {
-              text: watermark,
-              color: 'rgba(148, 163, 184, 0.15)',
-              fontSize: 24,
-              fontStyle: 'normal',
-              fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial',
-            },
-          ],
-        })
-      : null;
-
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
+
+    // Track user viewport (logical range) so we can restore it after data refreshes.
+    // This prevents the chart from drifting back to the right when new candles arrive.
+    const timeScale = chart.timeScale();
+    const onLogicalRange = (r: LogicalRange | null) => {
+      if (suppressRangeCaptureRef.current) return;
+      lastLogicalRangeRef.current = r;
+      if (r) didInitialFitRef.current = true;
+    };
+    timeScale.subscribeVisibleLogicalRangeChange(onLogicalRange);
 
     const ro = new ResizeObserver(() => {
       const rect = el.getBoundingClientRect();
@@ -183,12 +193,61 @@ export function CandlestickChart({
 
     return () => {
       ro.disconnect();
-      watermarkPlugin?.detach();
+      try {
+        timeScale.unsubscribeVisibleLogicalRangeChange(onLogicalRange);
+      } catch {
+        // ignore
+      }
+      try {
+        watermarkPluginRef.current?.detach();
+      } catch {
+        // ignore
+      }
+      watermarkPluginRef.current = null;
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
     };
+  }, []);
+
+  // Update watermark without recreating the chart.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    // Treat watermark changes as a dataset switch (instrument). Reset the viewport
+    // bookkeeping so the new dataset can fit once.
+    didInitialFitRef.current = false;
+    lastLogicalRangeRef.current = null;
+
+    try {
+      watermarkPluginRef.current?.detach();
+    } catch {
+      // ignore
+    }
+    watermarkPluginRef.current = null;
+
+    if (!watermark) return;
+
+    try {
+      watermarkPluginRef.current = createTextWatermark(chart.panes()[0], {
+        visible: true,
+        horzAlign: 'center',
+        vertAlign: 'center',
+        lines: [
+          {
+            text: watermark,
+            color: 'rgba(148, 163, 184, 0.15)',
+            fontSize: 24,
+            fontStyle: 'normal',
+            fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial',
+          },
+        ],
+      });
+    } catch {
+      // ignore
+    }
   }, [watermark]);
 
   // Update series data.
@@ -198,10 +257,36 @@ export function CandlestickChart({
     const volumeSeries = volumeSeriesRef.current;
     if (!chart || !candleSeries || !volumeSeries) return;
 
-    candleSeries.setData(data.candleData);
-    volumeSeries.setData(data.volumeData);
+    const timeScale = chart.timeScale();
+    const desiredLogicalRange = lastLogicalRangeRef.current ?? timeScale.getVisibleLogicalRange();
 
-    chart.timeScale().fitContent();
+    suppressRangeCaptureRef.current = true;
+
+    try {
+      candleSeries.setData(data.candleData);
+      volumeSeries.setData(data.volumeData);
+
+      // Important: never call fitContent() on every refresh, as it resets user zoom/pan.
+      // Preserve viewport across refreshes by restoring the previously visible *logical* range.
+      if (!data.candleData.length) return;
+
+      if (desiredLogicalRange) {
+        try {
+          timeScale.setVisibleLogicalRange(desiredLogicalRange);
+          didInitialFitRef.current = true;
+          return;
+        } catch {
+          // If the previous range is no longer valid, fall back to initial fit.
+        }
+      }
+
+      if (!didInitialFitRef.current) {
+        timeScale.fitContent();
+        didInitialFitRef.current = true;
+      }
+    } finally {
+      suppressRangeCaptureRef.current = false;
+    }
   }, [data]);
 
   // Update overlay price lines.
@@ -218,6 +303,7 @@ export function CandlestickChart({
       }
     }
     overlayLinesRef.current = [];
+    namedLinesRef.current = {};
 
     // Lightweight-charts doesn't expose a full "clear all price lines" API.
     // Recreate series would be overkill; instead, we add a small, bounded number of lines
@@ -242,10 +328,106 @@ export function CandlestickChart({
     supports.forEach((p, idx) => overlayLinesRef.current.push(createLine(p, 'rgba(56,189,248,0.85)', `S${idx + 1}`)));
     resistances.forEach((p, idx) => overlayLinesRef.current.push(createLine(p, 'rgba(251,146,60,0.85)', `R${idx + 1}`)));
 
-    if (typeof overlays?.entry === 'number') overlayLinesRef.current.push(createLine(overlays.entry, 'rgba(34,197,94,0.9)', 'Entry'));
-    if (typeof overlays?.stop_loss === 'number') overlayLinesRef.current.push(createLine(overlays.stop_loss, 'rgba(244,63,94,0.9)', 'SL'));
-    if (typeof overlays?.target === 'number') overlayLinesRef.current.push(createLine(overlays.target, 'rgba(59,130,246,0.9)', 'Target'));
+    if (typeof overlays?.entry === 'number') {
+      const l = createLine(overlays.entry, 'rgba(34,197,94,0.9)', 'Entry');
+      overlayLinesRef.current.push(l);
+      namedLinesRef.current.entry = l;
+    }
+    if (typeof overlays?.stop_loss === 'number') {
+      const l = createLine(overlays.stop_loss, 'rgba(244,63,94,0.9)', 'SL');
+      overlayLinesRef.current.push(l);
+      namedLinesRef.current.stop_loss = l;
+    }
+    if (typeof overlays?.target === 'number') {
+      const l = createLine(overlays.target, 'rgba(59,130,246,0.9)', 'Target');
+      overlayLinesRef.current.push(l);
+      namedLinesRef.current.target = l;
+    }
   }, [candles, overlays]);
+
+  // Draggable TP/SL lines (drag to modify).
+  useEffect(() => {
+    const el = containerRef.current;
+    const candleSeries = candleSeriesRef.current;
+    if (!el || !candleSeries) return;
+
+    const canDragSL = Boolean(draggable?.stop_loss);
+    const canDragTP = Boolean(draggable?.target);
+    if (!canDragSL && !canDragTP) return;
+
+    const pickLineAtY = (y: number): DraggableOverlayKey | null => {
+      const thresholdPx = 8;
+      const candidates: Array<{ key: DraggableOverlayKey; dy: number }> = [];
+
+      const sl = overlays?.stop_loss;
+      const tp = overlays?.target;
+
+      if (canDragSL && typeof sl === 'number') {
+        const cy = candleSeries.priceToCoordinate(sl);
+        if (cy != null) candidates.push({ key: 'stop_loss', dy: Math.abs(cy - y) });
+      }
+      if (canDragTP && typeof tp === 'number') {
+        const cy = candleSeries.priceToCoordinate(tp);
+        if (cy != null) candidates.push({ key: 'target', dy: Math.abs(cy - y) });
+      }
+
+      candidates.sort((a, b) => a.dy - b.dy);
+      if (candidates.length && candidates[0].dy <= thresholdPx) return candidates[0].key;
+      return null;
+    };
+
+    const onMouseDown = (e: MouseEvent) => {
+      const rect = el.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      const hit = pickLineAtY(y);
+      if (!hit) return;
+      dragStateRef.current.active = hit;
+      dragStateRef.current.isDragging = true;
+      e.preventDefault();
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!dragStateRef.current.isDragging) return;
+      const key = dragStateRef.current.active;
+      if (!key) return;
+
+      const rect = el.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      const price = candleSeries.coordinateToPrice(y);
+      if (price == null || !Number.isFinite(price)) return;
+
+      const line = key === 'stop_loss' ? namedLinesRef.current.stop_loss : namedLinesRef.current.target;
+      if (!line) return;
+      try {
+        line.applyOptions({ price: Number(price) });
+      } catch {
+        // ignore
+      }
+    };
+
+    const endDrag = (e: MouseEvent) => {
+      if (!dragStateRef.current.isDragging) return;
+      const key = dragStateRef.current.active;
+      dragStateRef.current.isDragging = false;
+      dragStateRef.current.active = null;
+      if (!key) return;
+      const rect = el.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      const price = candleSeries.coordinateToPrice(y);
+      if (price == null || !Number.isFinite(price)) return;
+      onDragEnd?.(key, Number(price));
+    };
+
+    el.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', endDrag);
+
+    return () => {
+      el.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', endDrag);
+    };
+  }, [draggable?.stop_loss, draggable?.target, overlays?.stop_loss, overlays?.target, onDragEnd]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

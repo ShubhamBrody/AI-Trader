@@ -125,7 +125,7 @@ export function IntradayPage() {
         side: String(analysis.trade.side ?? 'neutral').toLowerCase(),
         confidence: Number(analysis.trade.confidence ?? 0),
         source: 'trade',
-        pattern_hint: analysis.trade.pattern_hint,
+        pattern_hint: { name: analysis.trade.pattern_hint },
       };
     }
     const pats: any[] = (analysis?.patterns ?? []) as any;
@@ -221,7 +221,7 @@ export function IntradayPage() {
         </CardHeader>
         <CardBody className="h-[420px]">
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <Button tone={showOverlays ? 'primary' : 'secondary'} onClick={() => setShowOverlays((v) => !v)}>
+            <Button variant={showOverlays ? 'primary' : 'secondary'} onClick={() => setShowOverlays((v) => !v)}>
               {showOverlays ? 'Overlays: ON' : 'Overlays: OFF'}
             </Button>
             {showOverlays ? (

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from app.agent.state import list_open_trades, local_day_bounds_utc, mark_trade_closed, record_trade_open
+from app.auth import token_store
 from app.core.db import db_conn
 from app.candles.service import CandleService
 from app.core.audit import log_event
@@ -79,8 +80,69 @@ class IndexOptionsHftService:
         # Track last processed candle timestamp per (underlying, interval)
         self._last_ts: dict[tuple[str, str], int] = {}
 
+    def _broker_override_key(self) -> str:
+        return "index_options_hft_broker"
+
+    def _load_broker_override(self) -> str | None:
+        try:
+            with db_conn() as conn:
+                row = conn.execute(
+                    "SELECT value FROM trade_controls WHERE key=? LIMIT 1",
+                    (self._broker_override_key(),),
+                ).fetchone()
+                if row is None:
+                    return None
+                v = str(row["value"] or "").strip().lower()
+                return v or None
+        except Exception:
+            return None
+
+    def _save_broker_override(self, broker: str, *, actor: str = "api") -> None:
+        ts = _now_ts()
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO trade_controls(key, value, ts_updated) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts_updated=excluded.ts_updated",
+                (self._broker_override_key(), str(broker), int(ts)),
+            )
+            conn.execute(
+                "INSERT INTO trade_controls(key, value, ts_updated) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts_updated=excluded.ts_updated",
+                (
+                    "last_change",
+                    json.dumps({"actor": actor, "key": self._broker_override_key(), "broker": str(broker)}, separators=(",", ":")),
+                    int(ts),
+                ),
+            )
+
+    def broker(self) -> BrokerName:
+        raw = self._load_broker_override() or str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper"))
+        broker: BrokerName = str(raw).lower().strip()  # type: ignore[assignment]
+        if broker not in {"paper", "upstox"}:
+            broker = "paper"  # type: ignore[assignment]
+        return broker
+
+    def set_broker(self, broker: str, *, actor: str = "api") -> dict[str, Any]:
+        b = str(broker or "").strip().lower()
+        if b not in {"paper", "upstox"}:
+            return {"ok": False, "detail": {"detail": "unsupported broker", "broker": b, "supported": ["paper", "upstox"]}}
+
+        if self._status.running:
+            return {"ok": False, "detail": "stop the HFT loop before switching broker"}
+
+        if b == "upstox":
+            if bool(settings.SAFE_MODE):
+                return {"ok": False, "detail": "SAFE_MODE=true: live trading disabled"}
+            if not token_store.is_logged_in():
+                return {"ok": False, "detail": "Upstox not authenticated. Open /api/auth/upstox/login"}
+
+        self._save_broker_override(b, actor=str(actor))
+        publish_sync("hft", "hft.broker", {"broker": b})
+        log_event("hft.index_options.broker", {"broker": b, "actor": str(actor)})
+        return {"ok": True, "broker": b}
+
     def status(self) -> dict[str, Any]:
-        broker = str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper"))
+        broker = str(self.broker())
         open_hft = self._count_open_hft_trades()
         today_bounds = self._today_bounds_utc()
         trades_today = self._count_trades_today_hft(bounds=today_bounds)
@@ -110,8 +172,8 @@ class IndexOptionsHftService:
         self._status.started_ts = _now_ts()
         self._status.last_error = None
         self._task = asyncio.create_task(self._run_loop())
-        publish_sync("hft", "hft.start", {"broker": str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper")), "safe_mode": bool(settings.SAFE_MODE)})
-        log_event("hft.index_options.start", {"broker": str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper"))})
+        publish_sync("hft", "hft.start", {"broker": str(self.broker()), "safe_mode": bool(settings.SAFE_MODE)})
+        log_event("hft.index_options.start", {"broker": str(self.broker())})
         return {"ok": True}
 
     async def stop(self) -> dict[str, Any]:
@@ -175,9 +237,7 @@ class IndexOptionsHftService:
         if not bool(getattr(settings, "INDEX_OPTIONS_HFT_ENABLED", False)):
             return {"ok": True, "skipped": True, "reason": "disabled"}
 
-        broker: BrokerName = str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper")).lower().strip()  # type: ignore[assignment]
-        if broker not in {"paper", "upstox"}:
-            broker = "paper"  # type: ignore[assignment]
+        broker: BrokerName = self.broker()
 
         controls = get_controls()
         if getattr(controls, "agent_disabled", False):
@@ -363,9 +423,7 @@ class IndexOptionsHftService:
         stop = float(opt_price) * (1.0 - _clamp(sl_pct, 0.01, 0.95))
         target = float(opt_price) * (1.0 + _clamp(tp_pct, 0.01, 2.0))
 
-        broker: BrokerName = str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper")).lower().strip()  # type: ignore[assignment]
-        if broker not in {"paper", "upstox"}:
-            broker = "paper"  # type: ignore[assignment]
+        broker: BrokerName = self.broker()
 
         # Place entry.
         placed = await self._enter_long_option(
@@ -656,7 +714,7 @@ class IndexOptionsHftService:
         if price is None or price <= 0:
             return
 
-        broker: BrokerName = str(getattr(settings, "INDEX_OPTIONS_HFT_BROKER", "paper")).lower().strip()  # type: ignore[assignment]
+        broker: BrokerName = self.broker()
         if broker == "upstox":
             # For now, we only record close; live exit wiring can be expanded similarly to entry.
             # Guarded by SAFE_MODE.

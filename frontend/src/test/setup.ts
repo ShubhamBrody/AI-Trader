@@ -7,8 +7,7 @@ class ResizeObserverStub {
   disconnect() {}
 }
 
-// @ts-expect-error - test env shim
-globalThis.ResizeObserver = globalThis.ResizeObserver ?? ResizeObserverStub;
+(globalThis as any).ResizeObserver = (globalThis as any).ResizeObserver ?? ResizeObserverStub;
 
 const originalWarn = console.warn;
 console.warn = (...args: any[]) => {
