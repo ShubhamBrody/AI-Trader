@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 from app.core.settings import settings
@@ -185,6 +188,7 @@ def train_deep_nse_eq(*, epochs: int, seq_len: int, batch_size: int, min_samples
             min_samples=int(min_samples),
             require_cuda=True,
             progress_cb=_map_progress,
+            resume=False,
         )
         done_work += 1
 
@@ -205,8 +209,165 @@ def train_deep_nse_eq(*, epochs: int, seq_len: int, batch_size: int, min_samples
             min_samples=int(min_samples),
             require_cuda=True,
             progress_cb=_map_progress,
+            resume=False,
         )
         done_work += 1
+
+    _print_progress("[deep]", start_ts=start_ts, progress=1.0, msg="done")
+
+
+def _load_json(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_json(path: str | None, obj: dict[str, Any]) -> None:
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def train_deep_nse_eq_budgeted(
+    *,
+    epochs: int,
+    epochs_per_run: int | None,
+    max_minutes: float | None,
+    seq_len: int,
+    batch_size: int,
+    min_samples: int,
+    max_symbols: int,
+    after: str | None,
+    page_size: int,
+    resume: bool,
+    checkpoint_dir: str | None,
+    state_file: str | None,
+    train_long: bool,
+    train_intraday: bool,
+) -> None:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available; deep NSE_EQ training requires GPU")
+
+    state = _load_json(state_file) or {}
+    effective_after = (after or "").strip() or None
+    if effective_after is None:
+        s_after = (state.get("nse_after") or "").strip()
+        effective_after = s_after or None
+
+    # Determine a per-run chunk size.
+    # If max_symbols is set (>0), it caps the chunk size.
+    effective_max_symbols = int(max_symbols)
+    chunk_symbols = 0
+    frac = float(state.get("symbols_fraction_per_run") or 0.0)
+    if "symbols_fraction_per_run" in state:
+        # Allow state file to override defaults if user wants.
+        frac = float(state.get("symbols_fraction_per_run") or 0.0)
+    if frac > 0.0 and frac < 1.0:
+        try:
+            uni = UniverseService()
+            total = int(uni.count(prefix="NSE_EQ|"))
+            if total > 0:
+                chunk_symbols = max(1, int(math.ceil(total * frac)))
+        except Exception:
+            chunk_symbols = 0
+
+    if chunk_symbols > 0:
+        if effective_max_symbols > 0:
+            effective_max_symbols = min(effective_max_symbols, int(chunk_symbols))
+        else:
+            effective_max_symbols = int(chunk_symbols)
+
+    keys = _iter_nse_eq_keys(max_symbols=effective_max_symbols, after=effective_after, page_size=page_size)
+    if not keys:
+        print("[deep] No NSE_EQ keys; skipping")
+        return
+
+    start_ts = time.time()
+    budget_seconds = float(max_minutes) * 60.0 if max_minutes is not None and float(max_minutes) > 0 else 0.0
+    total_work = max(1, len(keys) * (int(bool(train_long)) + int(bool(train_intraday))))
+    done_work = 0
+
+    _print_progress(
+        "[deep]",
+        start_ts=start_ts,
+        progress=0.0,
+        msg=f"starting budgeted NSE_EQ deep training for {len(keys)} symbols (after={effective_after} max={effective_max_symbols or 'all'})",
+    )
+
+    for instrument_key in keys:
+        def _map_progress(frac: float, message: str, metrics: dict | None = None) -> None:
+            overall = (done_work + max(0.0, min(1.0, float(frac)))) / total_work
+            _print_progress("[deep]", start_ts=start_ts, progress=overall, msg=f"{instrument_key}: {message}")
+
+        # Time budget check (between symbols)
+        if budget_seconds > 0 and (time.time() - start_ts) >= budget_seconds:
+            print(f"[deep] Budget reached ({max_minutes} min). Saving cursor and exiting.")
+            _save_json(
+                state_file,
+                {"nse_after": instrument_key, "updated_ts": int(_utc_now().timestamp()), "note": "budget_stop"},
+            )
+            return
+
+        if bool(train_long):
+            _print_progress("[deep]", start_ts=start_ts, progress=done_work / total_work, msg=f"training long {instrument_key}")
+            train_deep_model(
+                instrument_key=instrument_key,
+                interval=settings.TRAIN_LONG_INTERVAL,
+                lookback_days=int(settings.TRAIN_LONG_LOOKBACK_DAYS),
+                horizon_steps=int(settings.TRAIN_LONG_HORIZON_STEPS),
+                model_family="long",
+                cap_tier=None,
+                seq_len=int(seq_len),
+                epochs=int(epochs),
+                batch_size=int(batch_size),
+                lr=2e-4,
+                weight_decay=1e-4,
+                min_samples=int(min_samples),
+                require_cuda=True,
+                progress_cb=_map_progress,
+                resume=bool(resume),
+                checkpoint_dir=checkpoint_dir,
+                epochs_per_run=int(epochs_per_run) if epochs_per_run is not None else None,
+            )
+            done_work += 1
+
+        if bool(train_intraday):
+            _print_progress("[deep]", start_ts=start_ts, progress=done_work / total_work, msg=f"training intraday {instrument_key}")
+            train_deep_model(
+                instrument_key=instrument_key,
+                interval=settings.TRAIN_INTRADAY_INTERVAL,
+                lookback_days=int(settings.TRAIN_INTRADAY_LOOKBACK_DAYS),
+                horizon_steps=int(settings.TRAIN_INTRADAY_HORIZON_STEPS),
+                model_family="intraday",
+                cap_tier=None,
+                seq_len=int(seq_len),
+                epochs=int(epochs),
+                batch_size=int(batch_size),
+                lr=2e-4,
+                weight_decay=1e-4,
+                min_samples=int(min_samples),
+                require_cuda=True,
+                progress_cb=_map_progress,
+                resume=bool(resume),
+                checkpoint_dir=checkpoint_dir,
+                epochs_per_run=int(epochs_per_run) if epochs_per_run is not None else None,
+            )
+            done_work += 1
+
+        # Update cursor after completing the symbol
+        _save_json(state_file, {"nse_after": instrument_key, "updated_ts": int(_utc_now().timestamp())})
 
     _print_progress("[deep]", start_ts=start_ts, progress=1.0, msg="done")
 
@@ -268,11 +429,26 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-ridge-batch", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--run-deep-nse-eq", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--run-pattern-seq", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--exit-after-deep", action=argparse.BooleanOptionalAction, default=False, help="Exit after deep stage completes (useful for chunked runs).")
 
+    p.add_argument(
+        "--ridge-universe",
+        default="default",
+        choices=["default", "nse_eq"],
+        help="Ridge batch universe: 'default' uses DEFAULT_UNIVERSE; 'nse_eq' iterates instrument_meta keys with prefix NSE_EQ|",
+    )
     p.add_argument("--ridge-min-samples", type=int, default=200)
     p.add_argument("--ridge-use-presets", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--deep-epochs", type=int, default=6)
+    p.add_argument("--deep-epochs-per-run", type=int, default=1, help="How many epochs to run per call (resume-friendly).")
+    p.add_argument("--deep-resume", action=argparse.BooleanOptionalAction, default=True, help="Resume from checkpoints/DB if available.")
+    p.add_argument("--deep-checkpoint-dir", default=None, help="Directory to store deep training checkpoints (default: next to DB).")
+    p.add_argument("--deep-max-minutes", type=float, default=0.0, help="Stop deep training after this many minutes (0 disables).")
+    p.add_argument("--deep-state-file", default=None, help="JSON file to persist NSE cursor between runs.")
+    p.add_argument("--deep-symbol-fraction-per-run", type=float, default=0.0, help="Train only this fraction of NSE_EQ symbols per run (e.g., 0.05 for 5%%).")
+    p.add_argument("--deep-train-long", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--deep-train-intraday", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--deep-seq-len", type=int, default=120)
     p.add_argument("--deep-batch-size", type=int, default=128)
     p.add_argument("--deep-min-samples", type=int, default=500)
@@ -299,20 +475,71 @@ def main(argv: list[str]) -> int:
     print("Training start (UTC):", _utc_now().isoformat())
     print("DATABASE_PATH:", settings.DATABASE_PATH)
     print("PATTERN_SEQ_MODEL_PATH:", getattr(settings, "PATTERN_SEQ_MODEL_PATH", "data/models/pattern_seq.pt"))
+    print("RIDGE_UNIVERSE:", str(args.ridge_universe))
+    print("NSE_AFTER:", args.nse_after)
+    print("NSE_MAX_SYMBOLS:", int(args.nse_max_symbols))
+    if float(args.deep_max_minutes or 0.0) > 0:
+        print("DEEP_MAX_MINUTES:", float(args.deep_max_minutes))
+    print("DEEP_EPOCHS_PER_RUN:", int(args.deep_epochs_per_run))
+    print("DEEP_RESUME:", bool(args.deep_resume))
 
     if bool(args.run_ridge_batch):
-        train_ridge_batch(min_samples=int(args.ridge_min_samples), use_presets=bool(args.ridge_use_presets))
+        if str(args.ridge_universe).lower().strip() == "nse_eq":
+            keys = _iter_nse_eq_keys(max_symbols=int(args.nse_max_symbols), after=args.nse_after, page_size=int(args.nse_page_size))
+            if not keys:
+                print("[ridge] No NSE_EQ keys; skipping")
+            else:
+                # Reuse ridge trainer by temporarily overriding DEFAULT_UNIVERSE selection.
+                # This avoids duplicating the ridge training loop.
+                orig = settings.DEFAULT_UNIVERSE
+                try:
+                    object.__setattr__(settings, "DEFAULT_UNIVERSE", ",".join(keys))
+                except Exception:
+                    # pydantic BaseSettings may be frozen depending on config; fall back to env var.
+                    os.environ["DEFAULT_UNIVERSE"] = ",".join(keys)
+                try:
+                    train_ridge_batch(min_samples=int(args.ridge_min_samples), use_presets=bool(args.ridge_use_presets))
+                finally:
+                    try:
+                        object.__setattr__(settings, "DEFAULT_UNIVERSE", orig)
+                    except Exception:
+                        if "DEFAULT_UNIVERSE" in os.environ:
+                            os.environ.pop("DEFAULT_UNIVERSE", None)
+        else:
+            train_ridge_batch(min_samples=int(args.ridge_min_samples), use_presets=bool(args.ridge_use_presets))
 
     if bool(args.run_deep_nse_eq):
-        train_deep_nse_eq(
+        state_file = str(args.deep_state_file) if args.deep_state_file else str(Path(settings.DATABASE_PATH).parent / "checkpoints" / "deep" / "nse_eq_cursor.json")
+
+        # Persist user knobs into state so repeated runs behave consistently.
+        if float(args.deep_symbol_fraction_per_run or 0.0) > 0:
+            _save_json(
+                state_file,
+                {
+                    "symbols_fraction_per_run": float(args.deep_symbol_fraction_per_run),
+                    "updated_ts": int(_utc_now().timestamp()),
+                },
+            )
+
+        train_deep_nse_eq_budgeted(
             epochs=int(args.deep_epochs),
+            epochs_per_run=int(args.deep_epochs_per_run) if int(args.deep_epochs_per_run) > 0 else None,
+            max_minutes=float(args.deep_max_minutes) if float(args.deep_max_minutes or 0.0) > 0 else None,
             seq_len=int(args.deep_seq_len),
             batch_size=int(args.deep_batch_size),
             min_samples=int(args.deep_min_samples),
             max_symbols=int(args.nse_max_symbols),
             after=args.nse_after,
             page_size=int(args.nse_page_size),
+            resume=bool(args.deep_resume),
+            checkpoint_dir=str(args.deep_checkpoint_dir) if args.deep_checkpoint_dir else None,
+            state_file=state_file,
+            train_long=bool(args.deep_train_long),
+            train_intraday=bool(args.deep_train_intraday),
         )
+
+        if bool(args.exit_after_deep):
+            return 0
 
     if bool(args.run_pattern_seq):
         train_pattern_seq_nse_eq(

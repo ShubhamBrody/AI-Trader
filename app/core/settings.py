@@ -120,6 +120,52 @@ class Settings(BaseSettings):
     AUTOTRADER_OVERLAYS_MIN_STOP_MOVE_PCT: float = 0.001
     AUTOTRADER_OVERLAYS_MIN_TARGET_MOVE_PCT: float = 0.002
 
+    # Index Options HFT (OFF by default)
+    # Trades long CALL/PUT options on NIFTY and SENSEX using 1m/5m signals.
+    INDEX_OPTIONS_HFT_ENABLED: bool = False
+    INDEX_OPTIONS_HFT_AUTOSTART: bool = False
+    INDEX_OPTIONS_HFT_BROKER: str = "paper"  # paper|upstox
+    INDEX_OPTIONS_HFT_POLL_SECONDS: int = 5
+
+    # Behavior toggles
+    # If true, only trade when NIFTY and SENSEX agree on 5m direction.
+    INDEX_OPTIONS_HFT_REQUIRE_MARKET_ALIGNMENT: bool = False
+    # If true, allow running paper HFT even when market_state != LIVE (useful for testing).
+    INDEX_OPTIONS_HFT_IGNORE_MARKET_STATE_WHEN_PAPER: bool = False
+
+    # Instrument queries used to resolve spot instrument_keys via instrument_meta.
+    # These should match entries in your imported Upstox exchange instruments.
+    INDEX_OPTIONS_HFT_NIFTY_SPOT_QUERY: str = "NIFTY"
+    INDEX_OPTIONS_HFT_SENSEX_SPOT_QUERY: str = "SENSEX"
+
+    # Lot sizes (set to your broker's current lot sizes)
+    INDEX_OPTIONS_HFT_NIFTY_LOT_SIZE: int = 50
+    INDEX_OPTIONS_HFT_SENSEX_LOT_SIZE: int = 10
+
+    # Selection
+    INDEX_OPTIONS_HFT_MAX_EXPIRY_DAYS: int = 14
+
+    # Signal/risk controls
+    INDEX_OPTIONS_HFT_SPOT_LOOKBACK_MINUTES: int = 240
+    INDEX_OPTIONS_HFT_MIN_CONFIDENCE: float = 0.70
+    INDEX_OPTIONS_HFT_RISK_FRACTION: float = 0.002
+    INDEX_OPTIONS_HFT_MAX_CAPITAL_PER_TRADE_INR: float = 5000.0
+    INDEX_OPTIONS_HFT_MAX_LOTS: int = 1
+
+    # Additional safety caps
+    INDEX_OPTIONS_HFT_MAX_OPEN_TRADES: int = 2
+    INDEX_OPTIONS_HFT_MAX_TRADES_PER_DAY: int = 20
+    # Set to 0 to disable daily loss stop.
+    INDEX_OPTIONS_HFT_MAX_DAILY_LOSS_INR: float = 0.0
+
+    # Exits (premium-based)
+    INDEX_OPTIONS_HFT_OPTION_STOP_PCT: float = 0.12
+    INDEX_OPTIONS_HFT_OPTION_TARGET_PCT: float = 0.18
+    INDEX_OPTIONS_HFT_MAX_HOLD_MINUTES: int = 30
+
+    # Adaptive learning persistence
+    INDEX_OPTIONS_HFT_STATE_PATH: str = "data/hft_index_options_state.json"
+
     # Training presets
     TRAIN_LONG_INTERVAL: str = "1d"
     TRAIN_LONG_LOOKBACK_DAYS: int = 1460  # ~4 years

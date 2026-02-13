@@ -17,6 +17,38 @@ router = APIRouter(prefix="/universe", tags=["universe"])
 svc = UniverseService()
 
 
+def _normalize_expiry(v: object) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    # Upstox exchange files often encode expiry as epoch millis.
+    try:
+        if s.isdigit() and len(s) >= 10:
+            n = int(s)
+            ts = (n / 1000.0) if n >= 1_000_000_000_000 else float(n)
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+    except Exception:
+        pass
+    return s
+
+
+def _normalize_option_type(it: dict) -> str | None:
+    raw = str(it.get("option_type") or "").strip().upper()
+    if raw in {"CE", "PE"}:
+        return raw
+    if raw in {"CALL", "C"}:
+        return "CE"
+    if raw in {"PUT", "P"}:
+        return "PE"
+
+    inst = str(it.get("instrument_type") or "").strip().upper()
+    if inst in {"CE", "PE"}:
+        return inst
+    return None
+
+
 class UniverseUpsert(BaseModel):
     instrument_key: str
     tradingsymbol: str | None = None
@@ -105,9 +137,9 @@ def import_upstox_nse_eq(limit: int = 0) -> dict:
                 "instrument_type": str(it.get("instrument_type") or "EQ"),
                 "name": (str(it.get("name") or "").strip() or None),
                 "underlying_symbol": (str(it.get("underlying_symbol") or "").strip() or None),
-                "expiry": (str(it.get("expiry") or "").strip() or None),
+                "expiry": _normalize_expiry(it.get("expiry")),
                 "strike": (float(it.get("strike_price")) if it.get("strike_price") not in (None, "") else None),
-                "option_type": (str(it.get("option_type") or "").strip() or None),
+                "option_type": _normalize_option_type(it),
                 "raw_json": json.dumps(it, ensure_ascii=False),
             }
         )
@@ -202,9 +234,9 @@ def import_upstox_exchange(exchange: str, limit: int = 0) -> dict:
                 "instrument_type": (str(it.get("instrument_type") or "").strip() or None),
                 "name": (str(it.get("name") or "").strip() or None),
                 "underlying_symbol": (str(it.get("underlying_symbol") or "").strip() or None),
-                "expiry": (str(it.get("expiry") or "").strip() or None),
+                "expiry": _normalize_expiry(it.get("expiry")),
                 "strike": (float(it.get("strike_price")) if it.get("strike_price") not in (None, "") else None),
-                "option_type": (str(it.get("option_type") or "").strip() or None),
+                "option_type": _normalize_option_type(it),
                 "raw_json": json.dumps(it, ensure_ascii=False),
             }
         )

@@ -272,6 +272,32 @@ async def ws_training(ws: WebSocket):
         return
 
 
+@router.websocket("/ws/hft")
+async def ws_hft(ws: WebSocket):
+    """Live HFT events via EventBus (channel: hft)."""
+    if not await _ws_auth(ws):
+        return
+    await ws.accept()
+    try:
+        since_id = ws.query_params.get("since_id")
+        history = int(ws.query_params.get("history", "200"))
+        since = (None if since_id is None else int(since_id))
+
+        recent = await BUS.recent("hft", limit=history, since_id=since)
+        for ev in recent:
+            await ws.send_json(ev.to_dict())
+
+        q = await BUS.subscribe("hft")
+        try:
+            while True:
+                ev = await q.get()
+                await ws.send_json(ev.to_dict())
+        finally:
+            await BUS.unsubscribe("hft", q)
+    except WebSocketDisconnect:
+        return
+
+
 @router.websocket("/ws/data")
 async def ws_data(ws: WebSocket):
     """Live data pipeline events.

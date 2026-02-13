@@ -12,6 +12,7 @@ import { NewsPage } from '@/pages/NewsPage';
 import { PortfolioPage } from '@/pages/PortfolioPage';
 import { PaperTradingPage } from '@/pages/PaperTradingPage';
 import { JournalPage } from '@/pages/JournalPage';
+import { HftIndexOptionsPage } from '@/pages/HftIndexOptionsPage';
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/paper" element={<PaperTradingPage />} />
         <Route path="/journal" element={<JournalPage />} />
+        <Route path="/hft" element={<HftIndexOptionsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Shell>

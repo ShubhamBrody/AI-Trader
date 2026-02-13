@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import agent, ai, alerts, audit, auth_upstox, automation, backtest, bootstrap, candles, chart, controls, data_pipeline, instruments, intraday, learning, market, metrics, news, orders, orders_state, paper, patterns, portfolio, positions, prediction, realtime, recommendations, safety, smart_search, strategy, trade, trade_state, universe, upstox, watchlist, ws
+from app.api import agent, ai, alerts, audit, auth_upstox, automation, backtest, bootstrap, candles, chart, controls, data_pipeline, hft_index_options, instruments, intraday, learning, market, metrics, news, orders, orders_state, paper, patterns, portfolio, positions, prediction, realtime, recommendations, safety, smart_search, strategy, trade, trade_state, universe, upstox, watchlist, ws
 
 api_router = APIRouter(prefix="/api")
 
@@ -22,6 +22,7 @@ api_router.include_router(safety.router, tags=["safety"])
 api_router.include_router(controls.router, tags=["controls"])
 api_router.include_router(ws.router, tags=["ws"])
 api_router.include_router(realtime.router, tags=["realtime"])
+api_router.include_router(hft_index_options.router, tags=["hft"])
 api_router.include_router(auth_upstox.router, tags=["auth"])
 api_router.include_router(upstox.router, tags=["upstox"])
 api_router.include_router(orders.router, tags=["orders"])

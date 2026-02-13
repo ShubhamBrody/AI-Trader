@@ -3,10 +3,14 @@ from __future__ import annotations
 # pyright: reportMissingImports=false
 
 import base64
+import hashlib
 import io
 import json
+import os
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -15,6 +19,45 @@ from app.ai.feature_engineering import compute_features
 from app.candles.persistence_sql import get_candles
 from app.core.db import db_conn
 from app.learning.registry import get_registry, slot_key as registry_slot_key
+
+
+def _default_deep_checkpoint_dir() -> Path:
+    # Prefer colocating checkpoints next to the DB so Kaggle/local runs keep artifacts together.
+    try:
+        from app.core.settings import settings
+
+        db_path = Path(str(getattr(settings, "DATABASE_PATH", "./data/app.db")))
+        base = (db_path.parent if db_path.parent else Path("."))
+        return (base / "checkpoints" / "deep").resolve()
+    except Exception:
+        return Path("data/checkpoints/deep").resolve()
+
+
+def _deep_checkpoint_path(*, model_key: str, checkpoint_dir: str | os.PathLike[str] | None) -> Path:
+    base = Path(checkpoint_dir) if checkpoint_dir else _default_deep_checkpoint_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha1(model_key.encode("utf-8")).hexdigest()[:20]
+    return base / f"{h}.pt"
+
+
+def _atomic_torch_save(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    import torch
+
+    torch.save(payload, tmp)
+    tmp.replace(path)
+
+
+def _try_load_torch_checkpoint(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        import torch
+
+        return dict(torch.load(path, map_location="cpu"))
+    except Exception:
+        return None
 
 
 def _deep_model_key(instrument_key: str, interval: str, horizon_steps: int, model_family: str | None, cap_tier: str | None) -> str:
@@ -173,6 +216,10 @@ def train_deep_model(
     require_cuda: bool = False,
     progress_cb: Any | None = None,
     patience: int = 3,
+    resume: bool = False,
+    checkpoint_dir: str | None = None,
+    epochs_per_run: int | None = None,
+    max_seconds: float | None = None,
 ) -> dict[str, Any]:
     if not _torch_available():
         return {"ok": False, "reason": "torch not installed"}
@@ -289,6 +336,72 @@ def train_deep_model(
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
     loss_fn = nn.HuberLoss(delta=1.0)
 
+    model_key = _deep_model_key(instrument_key, interval, horizon_steps, model_family, cap_tier)
+    ckpt_path = _deep_checkpoint_path(model_key=model_key, checkpoint_dir=checkpoint_dir)
+    ckpt = _try_load_torch_checkpoint(ckpt_path) if bool(resume) else None
+
+    # Best-effort resume:
+    # 1) Prefer disk checkpoint (includes optimizer + progress)
+    # 2) Fall back to DB model weights (no optimizer)
+    start_epoch = 0
+    best_val = 1e9
+    best_state = None
+    best_epoch = 0
+    no_improve = 0
+    if isinstance(ckpt, dict) and ckpt.get("kind") == "deep_train_ckpt_v1" and ckpt.get("model_key") == model_key:
+        try:
+            msd = ckpt.get("model_state")
+            if isinstance(msd, dict):
+                model.load_state_dict(msd)
+            osd = ckpt.get("opt_state")
+            if isinstance(osd, dict):
+                opt.load_state_dict(osd)
+            start_epoch = int(ckpt.get("epoch") or 0)
+            best_val = float(ckpt.get("best_val") or best_val)
+            best_state = ckpt.get("best_state") if isinstance(ckpt.get("best_state"), dict) else None
+            best_epoch = int(ckpt.get("best_epoch") or 0)
+            no_improve = int(ckpt.get("no_improve") or 0)
+            # Restore RNG for better continuity (optional)
+            try:
+                rs = ckpt.get("rng") or {}
+                if isinstance(rs, dict):
+                    if isinstance(rs.get("python"), tuple):
+                        random.setstate(rs["python"])
+                    if isinstance(rs.get("numpy"), tuple):
+                        np.random.set_state(rs["numpy"])
+                    if isinstance(rs.get("torch"), (bytes, bytearray)):
+                        torch.set_rng_state(rs["torch"])
+                    if torch.cuda.is_available() and isinstance(rs.get("torch_cuda"), list):
+                        try:
+                            torch.cuda.set_rng_state_all(rs["torch_cuda"])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception:
+            # If checkpoint is corrupt/mismatched, ignore and continue from scratch.
+            start_epoch = 0
+            best_val = 1e9
+            best_state = None
+            best_epoch = 0
+            no_improve = 0
+    elif bool(resume):
+        try:
+            prev = load_deep_model(
+                instrument_key=instrument_key,
+                interval=interval,
+                horizon_steps=int(horizon_steps),
+                model_family=model_family,
+                cap_tier=cap_tier,
+            )
+            if prev and prev.state_dict_b64:
+                raw = base64.b64decode(prev.state_dict_b64.encode("ascii"))
+                state = torch.load(io.BytesIO(raw), map_location="cpu")
+                if isinstance(state, dict):
+                    model.load_state_dict(state)
+        except Exception:
+            pass
+
     def eval_loss() -> float:
         model.eval()
         losses = []
@@ -300,13 +413,19 @@ def train_deep_model(
                 losses.append(float(loss_fn(pred, yb).item()))
         return float(np.mean(losses)) if losses else 0.0
 
-    best_val = 1e9
-    best_state = None
-    best_epoch = 0
-    no_improve = 0
     epoch_times: list[float] = []
 
-    for ep in range(int(epochs)):
+    target_epochs = int(epochs)
+    if start_epoch >= target_epochs:
+        # Nothing to do; still refresh DB entry with existing weights.
+        pass
+
+    run_start = datetime.now(timezone.utc)
+    max_ep = target_epochs
+    if epochs_per_run is not None and int(epochs_per_run) > 0:
+        max_ep = min(target_epochs, start_epoch + int(epochs_per_run))
+
+    for ep in range(int(start_epoch), int(max_ep)):
         ep_t0 = datetime.now(timezone.utc)
         model.train()
         train_losses: list[float] = []
@@ -337,17 +456,17 @@ def train_deep_model(
         ep_dt = (datetime.now(timezone.utc) - ep_t0).total_seconds()
         epoch_times.append(float(ep_dt))
         avg_epoch = float(np.mean(epoch_times)) if epoch_times else 0.0
-        remaining = max(0, int(epochs) - (ep + 1))
+        remaining = max(0, int(target_epochs) - (ep + 1))
         eta_seconds = float(avg_epoch * remaining)
 
         if progress_cb is not None:
             try:
                 progress_cb(
-                    float((ep + 1) / max(1, int(epochs))),
-                    f"epoch {ep + 1}/{int(epochs)}",
+                    float((ep + 1) / max(1, int(target_epochs))),
+                    f"epoch {ep + 1}/{int(target_epochs)}",
                     {
                         "epoch": int(ep + 1),
-                        "epochs": int(epochs),
+                        "epochs": int(target_epochs),
                         "train_huber": float(tr),
                         "val_huber": float(v),
                         "best_val_huber": float(best_val),
@@ -360,6 +479,56 @@ def train_deep_model(
                 )
             except Exception:
                 pass
+
+        # Persist training checkpoint each epoch so runs can be very short.
+        try:
+            rng = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            }
+            _atomic_torch_save(
+                ckpt_path,
+                {
+                    "kind": "deep_train_ckpt_v1",
+                    "model_key": model_key,
+                    "instrument_key": instrument_key,
+                    "interval": interval,
+                    "horizon_steps": int(horizon_steps),
+                    "model_family": model_family,
+                    "cap_tier": cap_tier,
+                    "seq_len": int(seq_len),
+                    "feature_dim": int(X_tr.shape[-1]),
+                    "epoch": int(ep + 1),
+                    "target_epochs": int(target_epochs),
+                    "best_val": float(best_val),
+                    "best_epoch": int(best_epoch),
+                    "no_improve": int(no_improve),
+                    "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    "best_state": best_state,
+                    "opt_state": opt.state_dict(),
+                    "rng": rng,
+                    "saved_ts": int(datetime.now(timezone.utc).timestamp()),
+                },
+            )
+        except Exception:
+            pass
+
+        # Budget stop (time)
+        if max_seconds is not None and float(max_seconds) > 0:
+            elapsed = (datetime.now(timezone.utc) - run_start).total_seconds()
+            if elapsed >= float(max_seconds):
+                if progress_cb is not None:
+                    try:
+                        progress_cb(
+                            float((ep + 1) / max(1, int(target_epochs))),
+                            "budget stop (max_seconds reached)",
+                            {"elapsed_seconds": float(elapsed), "max_seconds": float(max_seconds)},
+                        )
+                    except Exception:
+                        pass
+                break
 
         # Early stopping
         if int(patience) > 0 and no_improve >= int(patience):
@@ -385,7 +554,7 @@ def train_deep_model(
 
     trained_ts = int(now.timestamp())
     m = DeepModel(
-        model_key=_deep_model_key(instrument_key, interval, horizon_steps, model_family, cap_tier),
+        model_key=model_key,
         instrument_key=instrument_key,
         interval=interval,
         horizon_steps=int(horizon_steps),

@@ -69,7 +69,11 @@ def suggest(
         e.underlying_symbol as underlying_symbol,
         e.expiry as expiry,
         e.strike as strike,
-        e.option_type as option_type
+        CASE
+            WHEN UPPER(COALESCE(e.option_type,'')) IN ('CE','PE') THEN e.option_type
+            WHEN UPPER(COALESCE(e.instrument_type,'')) IN ('CE','PE') THEN e.instrument_type
+            ELSE NULL
+        END as option_type
     FROM instrument_meta m
     LEFT JOIN instrument_extra e ON e.instrument_key = m.instrument_key
     WHERE (

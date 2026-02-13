@@ -16,6 +16,7 @@ from app.utils.logger import configure_logging
 from app.prediction.live import LivePredictorConfig, PREDICTOR
 from app.orders.startup_recovery import startup_order_recovery
 from app.reconcile.loop import RECONCILER
+from app.hft.index_options.service import HFT_INDEX_OPTIONS
 
 
 def create_app() -> FastAPI:
@@ -49,10 +50,21 @@ def create_app() -> FastAPI:
                     calibration_alpha=float(settings.PREDICTOR_CALIBRATION_ALPHA),
                 )
                 await PREDICTOR.start(instrument_keys=keys, cfg=cfg)
+
+        if getattr(settings, "INDEX_OPTIONS_HFT_AUTOSTART", False):
+            # Safe-by-default: also requires INDEX_OPTIONS_HFT_ENABLED=true.
+            try:
+                await HFT_INDEX_OPTIONS.start()
+            except Exception:
+                pass
         yield
         # best-effort shutdown
         try:
             await PREDICTOR.stop()
+        except Exception:
+            pass
+        try:
+            await HFT_INDEX_OPTIONS.stop()
         except Exception:
             pass
         try:

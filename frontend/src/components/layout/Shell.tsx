@@ -12,6 +12,7 @@ import {
   Newspaper,
   Shield,
   Wallet,
+  Zap,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { Button } from '@/components/ui/Button';
@@ -32,6 +33,7 @@ const nav = [
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
   { to: '/paper', label: 'Paper Trading', icon: Activity },
   { to: '/journal', label: 'Journal', icon: FileText },
+  { to: '/hft', label: 'HFT (Options)', icon: Zap },
 ];
 
 export function Shell({ children }: PropsWithChildren) {
