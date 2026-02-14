@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import agent, ai, alerts, audit, auth_upstox, automation, backtest, bootstrap, candles, chart, controls, data_pipeline, hft_index_options, instruments, intraday, learning, market, metrics, news, orders, orders_state, paper, patterns, portfolio, positions, prediction, realtime, recommendations, safety, smart_search, strategy, trade, trade_state, universe, upstox, watchlist, ws
+from app.api import adaptive_algo, agent, ai, alerts, audit, auth_upstox, automation, backtest, bootstrap, candles, chart, controls, data_pipeline, hft_index_options, instruments, intraday, learning, market, metrics, news, orders, orders_state, paper, patterns, portfolio, positions, prediction, realtime, recommendations, safety, smart_search, strategy, trade, trade_state, trader, universe, upstox, watchlist, ws
 
 api_router = APIRouter(prefix="/api")
 
@@ -8,10 +8,12 @@ api_router.include_router(candles.router, tags=["candles"])
 api_router.include_router(intraday.router, tags=["intraday"])
 api_router.include_router(chart.router, tags=["chart"])
 api_router.include_router(ai.router, tags=["ai"])
+api_router.include_router(trader.router, tags=["trader"])
 api_router.include_router(instruments.router, tags=["instruments"])
 api_router.include_router(strategy.router, tags=["strategy"])
 api_router.include_router(backtest.router, tags=["backtest"])
 api_router.include_router(recommendations.router, tags=["recommendations"])
+api_router.include_router(adaptive_algo.router, tags=["adaptive-algo"])
 api_router.include_router(smart_search.router, tags=["smart-search"])
 api_router.include_router(trade.router, tags=["trade"])
 api_router.include_router(trade_state.router, tags=["trade-state"])

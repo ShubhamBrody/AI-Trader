@@ -125,7 +125,8 @@ def execute_trade(
     highs = [float(c.high) for c in candles][-220:]
     lows = [float(c.low) for c in candles][-220:]
     closes = [float(c.close) for c in candles][-220:]
-    idea = svc_engine.build_idea(symbol=ik, highs=highs, lows=lows, closes=closes)
+    volumes = [float(getattr(c, "volume", 0.0) or 0.0) for c in candles][-220:]
+    idea = svc_engine.build_idea(symbol=ik, highs=highs, lows=lows, closes=closes, volumes=volumes)
     action = str(idea.side).upper()
 
     if action not in {"BUY", "SELL"}:

@@ -13,6 +13,7 @@ from app.portfolio.service import PortfolioService
 from app.realtime.bus import BUS
 from app.core.settings import settings
 from app.ai.intraday_overlays import analyze_intraday
+from app.api.ws_schemas import wrap_legacy_ws_event
 
 router = APIRouter()
 
@@ -80,7 +81,16 @@ async def ws_candles(ws: WebSocket):
                 err = str(e)[:200]
 
             if err:
-                await ws.send_json({"type": "error", "detail": err, "server_ts": int(end.timestamp())})
+                server_ts = int(end.timestamp())
+                await ws.send_json(
+                    wrap_legacy_ws_event(
+                        channel="candles",
+                        type="error",
+                        payload={"detail": err, "server_ts": server_ts},
+                        ts=server_ts,
+                        legacy={"type": "error", "detail": err, "server_ts": server_ts},
+                    )
+                )
             elif candles:
                 c = candles[-1]
                 ts = int(getattr(c, "ts"))
@@ -92,14 +102,22 @@ async def ws_candles(ws: WebSocket):
                     "close": float(c.close),
                     "volume": float(c.volume),
                 }
+                server_ts = int(end.timestamp())
+                legacy = {
+                    "type": "candle_update",
+                    "instrument_key": instrument_key,
+                    "interval": interval,
+                    "candle": candle,
+                    "server_ts": server_ts,
+                }
                 await ws.send_json(
-                    {
-                        "type": "candle_update",
-                        "instrument_key": instrument_key,
-                        "interval": interval,
-                        "candle": candle,
-                        "server_ts": int(end.timestamp()),
-                    }
+                    wrap_legacy_ws_event(
+                        channel="candles",
+                        type="candle_update",
+                        payload=dict(legacy),
+                        ts=server_ts,
+                        legacy=legacy,
+                    )
                 )
             await asyncio.sleep(poll_seconds)
     except WebSocketDisconnect:
@@ -147,7 +165,16 @@ async def ws_intraday_overlays(ws: WebSocket):
                 err = str(e)[:200]
 
             if err:
-                await ws.send_json({"type": "error", "detail": err, "server_ts": int(end.timestamp())})
+                server_ts = int(end.timestamp())
+                await ws.send_json(
+                    wrap_legacy_ws_event(
+                        channel="intraday-overlays",
+                        type="error",
+                        payload={"detail": err, "server_ts": server_ts},
+                        ts=server_ts,
+                        legacy={"type": "error", "detail": err, "server_ts": server_ts},
+                    )
+                )
             else:
                 cur_ts = None
                 try:
@@ -168,14 +195,22 @@ async def ws_intraday_overlays(ws: WebSocket):
                     _perf_log("ws.overlays.analyze_intraday", (time.perf_counter() - t1) * 1000.0, instrument_key=instrument_key, interval=interval, n=len(candles or []))
                     last_analysis = analysis
                     last_candle_ts = cur_ts
+                server_ts = int(end.timestamp())
+                legacy = {
+                    "type": "intraday_overlays",
+                    "instrument_key": instrument_key,
+                    "interval": interval,
+                    "analysis": analysis,
+                    "server_ts": server_ts,
+                }
                 await ws.send_json(
-                    {
-                        "type": "intraday_overlays",
-                        "instrument_key": instrument_key,
-                        "interval": interval,
-                        "analysis": analysis,
-                        "server_ts": int(end.timestamp()),
-                    }
+                    wrap_legacy_ws_event(
+                        channel="intraday-overlays",
+                        type="intraday_overlays",
+                        payload=dict(legacy),
+                        ts=server_ts,
+                        legacy=legacy,
+                    )
                 )
 
             await asyncio.sleep(poll_seconds)
@@ -195,15 +230,24 @@ async def ws_alerts(ws: WebSocket):
 
         while True:
             bal = svc.balance(source=source)
-            payload = {
+            server_ts = int(datetime.now(timezone.utc).timestamp())
+            legacy = {
                 "type": "balance",
                 "source": bal.get("source"),
                 "balance": bal.get("balance"),
                 "segment": bal.get("segment"),
                 "alert": bal.get("alert"),
-                "server_ts": int(datetime.now(timezone.utc).timestamp()),
+                "server_ts": server_ts,
             }
-            await ws.send_json(payload)
+            await ws.send_json(
+                wrap_legacy_ws_event(
+                    channel="alerts",
+                    type="balance",
+                    payload=dict(legacy),
+                    ts=server_ts,
+                    legacy=legacy,
+                )
+            )
             await asyncio.sleep(poll_seconds)
     except WebSocketDisconnect:
         return

@@ -9,6 +9,9 @@ from app.ai.candlestick_patterns import detect_patterns as detect_candlestick_pa
 from app.ai.candlestick_patterns import to_candles as to_pattern_candles
 from app.ai.intraday_overlay_model import featurize, load_model
 from app.ai.pattern_memory import ensure_catalog_rows, get_weights_cached
+from app.core.settings import settings
+from app.learning.service import load_model as load_ridge_model
+from app.universe.service import UniverseService
 
 
 _PATTERN_ROWS_READY = False
@@ -253,6 +256,187 @@ def analyze_intraday(
     patterns: list[dict[str, Any]] = []
     trade: dict[str, Any] | None = None
 
+    # -------------------------------
+    # AI-first price forecast (ridge if available; else rules fallback)
+    # -------------------------------
+    closes_for_ai = [_f(_candle_get(c, "close")) for c in cs]
+
+    def _interval_minutes(iv: str) -> int:
+        s = str(iv or "").strip().lower()
+        if s.endswith("m"):
+            try:
+                return max(1, int(s[:-1]))
+            except Exception:
+                return 1
+        if s.endswith("h"):
+            try:
+                return max(1, int(s[:-1]) * 60)
+            except Exception:
+                return 60
+        return 1
+
+    iv_min = _interval_minutes(interval)
+    # Prefer common horizons used by lightweight training (e.g., 1m -> h60).
+    horizon_candidates: list[int]
+    if iv_min <= 1:
+        horizon_candidates = [60, 30, 15, 5, 1]
+    elif iv_min <= 3:
+        horizon_candidates = [20, 10, 5, 1]
+    elif iv_min <= 5:
+        horizon_candidates = [12, 6, 3, 1]
+    elif iv_min <= 15:
+        horizon_candidates = [4, 2, 1]
+    else:
+        horizon_candidates = [1]
+
+    fam_base = "intraday" if str(interval).endswith("m") else "long"
+    suf = str(getattr(settings, "MODEL_FAMILY_SUFFIX", "") or "")
+    fam_candidates: list[str] = []
+    if suf:
+        if not suf.startswith("_"):
+            suf = "_" + suf
+        fam_candidates.append(f"{fam_base}{suf}")
+    else:
+        fam_candidates.append(str(fam_base))
+        fam_candidates.append(f"{fam_base}_lightweight")
+
+    try:
+        cap = UniverseService().get_cap_tier(instrument_key)
+    except Exception:
+        cap = None
+
+    ai_forecast_ret: float | None = None
+    ai_model_name: str = "rules_fallback_v1"
+    ai_model_family: str | None = None
+    ai_horizon: int | None = None
+    ai_metrics: dict[str, Any] | None = None
+
+    # Try learned ridge model first.
+    for h in horizon_candidates:
+        for fam in fam_candidates:
+            try:
+                m = load_ridge_model(instrument_key, interval, horizon_steps=int(h), model_family=fam, cap_tier=cap)
+                if m is None:
+                    continue
+                ai_forecast_ret = float(m.predict_return(closes_for_ai))
+                ai_model_name = "ridge_regression_v1"
+                ai_model_family = fam
+                ai_horizon = int(h)
+                ai_metrics = {"model_key": m.model_key, "trained_ts": int(m.trained_ts), "metrics": dict(m.metrics or {})}
+                break
+            except Exception:
+                continue
+        if ai_forecast_ret is not None:
+            break
+
+    # If no model, compute a bounded fallback return from recent momentum/mean return.
+    if ai_forecast_ret is None:
+        arr = [float(x) for x in closes_for_ai if float(x) > 0]
+        if len(arr) >= 3:
+            rets = [(arr[i] / max(1e-9, arr[i - 1]) - 1.0) for i in range(1, len(arr))]
+            mean_ret = float(sum(rets[-10:]) / max(1, min(10, len(rets))))
+            # Momentum over last ~6 candles.
+            mom_window = min(6, len(arr))
+            momentum = float(arr[-1] / max(1e-9, arr[-mom_window]) - 1.0) if mom_window >= 2 else 0.0
+            # Use ATR-derived vol proxy when available.
+            vol = 0.0
+            if rets and len(rets) >= 2:
+                mu = float(sum(rets[-20:]) / max(1, min(20, len(rets))))
+                var = float(sum((r - mu) ** 2 for r in rets[-20:]) / max(1, min(20, len(rets))))
+                vol = float(max(0.0, var) ** 0.5)
+            if vol <= 0 and last_close > 0 and atr > 0:
+                vol = float(max(1e-6, atr / last_close))
+            shrink = 1.0 / (1.0 + 40.0 * float(vol))
+            raw_score = 0.55 * mean_ret + 0.45 * momentum
+            ai_forecast_ret = float(math.tanh(raw_score * 3.0) * 0.008) * float(shrink)
+        else:
+            ai_forecast_ret = 0.0
+
+    # Confidence/uncertainty heuristics for overlays.
+    # Note: keep these stable for UI even when learned model is missing.
+    # Vol proxy for uncertainty.
+    vol_proxy = 0.0
+    try:
+        if last_close > 0 and atr > 0:
+            vol_proxy = float(max(1e-6, atr / last_close))
+    except Exception:
+        vol_proxy = 0.0
+    uncertainty = float(max(0.0, min(1.0, vol_proxy * 8.0)))
+
+    dir_acc = None
+    try:
+        if isinstance(ai_metrics, dict):
+            mm = ai_metrics.get("metrics") or {}
+            dir_acc = float(mm.get("direction_acc")) if "direction_acc" in mm else None
+    except Exception:
+        dir_acc = None
+
+    acc_score = 0.0
+    if dir_acc is not None:
+        acc_score = float(max(0.0, min(1.0, (dir_acc - 0.5) * 2.0)))
+
+    thr = float(max(0.0008, vol_proxy * 0.25))
+    if ai_horizon:
+        thr = float(min(0.01, thr * (ai_horizon**0.5) * 0.8))
+
+    if float(ai_forecast_ret) > thr:
+        ai_signal = "buy"
+    elif float(ai_forecast_ret) < -thr:
+        ai_signal = "sell"
+    else:
+        ai_signal = "neutral"
+
+    mag_score = float(min(1.0, abs(float(ai_forecast_ret)) / max(1e-6, thr * 2.0)))
+    base_conf = 0.45 if ai_model_name == "ridge_regression_v1" else 0.35
+    confidence = float(max(0.0, min(1.0, base_conf + 0.35 * acc_score + 0.25 * mag_score - 0.25 * uncertainty)))
+
+    predicted_close = float(last_close * (1.0 + float(ai_forecast_ret))) if last_close > 0 else float(last_close)
+    ai_price = {
+        "model": ai_model_name,
+        "model_family": ai_model_family,
+        "horizon_steps": ai_horizon,
+        "forecast_return": float(ai_forecast_ret),
+        "predicted_close": float(predicted_close),
+        "signal": ai_signal,
+        "confidence": float(confidence),
+        "uncertainty": float(uncertainty),
+        "metrics": ai_metrics,
+    }
+
+    # Prefer AI signal for the trade plan (keep heuristics as fallback only).
+    if ai_signal in {"buy", "sell"} and last_close > 0 and atr > 0:
+        entry = float(last_close)
+        stop_dist = float(max(atr * 1.1, buffer * 2.0))
+        tgt_min = float(max(atr * 1.8, buffer * 3.0))
+        if ai_signal == "buy":
+            stop = float(entry - stop_dist)
+            target = float(max(entry + tgt_min, predicted_close))
+            trade = {
+                "side": "buy",
+                "entry": entry,
+                "stop": stop,
+                "target": target,
+                "confidence": float(confidence),
+                "reason": "ai_forecast",
+                "forecast_return": float(ai_forecast_ret),
+                "predicted_close": float(predicted_close),
+            }
+        else:
+            stop = float(entry + stop_dist)
+            target = float(min(entry - tgt_min, predicted_close))
+            trade = {
+                "side": "sell",
+                "entry": entry,
+                "stop": stop,
+                "target": target,
+                "confidence": float(confidence),
+                "reason": "ai_forecast",
+                "forecast_return": float(ai_forecast_ret),
+                "predicted_close": float(predicted_close),
+            }
+
+    patterns.append({"type": "ai_signal", "side": ai_signal, "confidence": float(confidence), "forecast_return": float(ai_forecast_ret)})
+
     # Candlestick pattern scan (multi-day sliding window via lookback upstream).
     candle_patterns: list[dict[str, Any]] = []
     try:
@@ -287,7 +471,7 @@ def analyze_intraday(
     except Exception:
         vol_ok = True
 
-    # Breakout / breakdown
+    # Breakout / breakdown (heuristic fallback; do not override an AI trade)
     if nearest_res is not None and last_close > nearest_res + buffer and vol_ok:
         conf = 0.55 + 0.35 * float(trend.get("strength") or 0.0)
         if str(trend.get("dir")) == "up":
@@ -295,36 +479,38 @@ def analyze_intraday(
         conf = float(max(0.0, min(1.0, conf)))
         patterns.append({"type": "breakout", "side": "buy", "level": float(nearest_res), "confidence": conf})
 
-        stop = float(nearest_res - max(buffer, atr * 0.75))
-        stop = float(min(stop, last_close - max(buffer, atr * 0.6)))
-        target = float(last_close + max(atr * 2.0, abs(last_close - nearest_res) * 2.0))
-        trade = {
-            "side": "buy",
-            "entry": float(last_close),
-            "stop": float(stop),
-            "target": float(target),
-            "confidence": conf,
-            "reason": "breakout_above_resistance",
-        }
+        if trade is None:
+            stop = float(nearest_res - max(buffer, atr * 0.75))
+            stop = float(min(stop, last_close - max(buffer, atr * 0.6)))
+            target = float(last_close + max(atr * 2.0, abs(last_close - nearest_res) * 2.0))
+            trade = {
+                "side": "buy",
+                "entry": float(last_close),
+                "stop": float(stop),
+                "target": float(target),
+                "confidence": conf,
+                "reason": "breakout_above_resistance",
+            }
 
-    if trade is None and nearest_sup is not None and last_close < nearest_sup - buffer and vol_ok:
+    if nearest_sup is not None and last_close < nearest_sup - buffer and vol_ok:
         conf = 0.55 + 0.35 * float(trend.get("strength") or 0.0)
         if str(trend.get("dir")) == "down":
             conf += 0.1
         conf = float(max(0.0, min(1.0, conf)))
         patterns.append({"type": "breakdown", "side": "sell", "level": float(nearest_sup), "confidence": conf})
 
-        stop = float(nearest_sup + max(buffer, atr * 0.75))
-        stop = float(max(stop, last_close + max(buffer, atr * 0.6)))
-        target = float(last_close - max(atr * 2.0, abs(last_close - nearest_sup) * 2.0))
-        trade = {
-            "side": "sell",
-            "entry": float(last_close),
-            "stop": float(stop),
-            "target": float(target),
-            "confidence": conf,
-            "reason": "breakdown_below_support",
-        }
+        if trade is None:
+            stop = float(nearest_sup + max(buffer, atr * 0.75))
+            stop = float(max(stop, last_close + max(buffer, atr * 0.6)))
+            target = float(last_close - max(atr * 2.0, abs(last_close - nearest_sup) * 2.0))
+            trade = {
+                "side": "sell",
+                "entry": float(last_close),
+                "stop": float(stop),
+                "target": float(target),
+                "confidence": conf,
+                "reason": "breakdown_below_support",
+            }
 
     # If no discrete pattern, still provide a "plan" based on trend + ATR and nearest levels.
     if trade is None:
@@ -436,7 +622,7 @@ def analyze_intraday(
     # ML-lite calibrator: predicts probability of favorable up-move.
     model = load_model(instrument_key, interval)
     if model is None:
-        base["ai"] = {"enabled": False, "model": None}
+        base["ai"] = {"enabled": False, "model": None, "price": ai_price}
         return base
 
     feats = featurize(cs[-max(80, 60) :])
@@ -486,5 +672,6 @@ def analyze_intraday(
         },
         "p_up": p_up,
         "features": feats,
+        "price": ai_price,
     }
     return base

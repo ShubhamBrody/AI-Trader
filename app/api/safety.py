@@ -30,9 +30,10 @@ def context() -> dict:
         "session": s.market_state,
         "ist_time": s.now_ist,
         "trading_day": s.trading_day,
-        "read_only": bool(settings.SAFE_MODE),
-        # For UI purposes, SAFE_MODE should behave like "can't trade".
-        "can_trade": (not s.trade_lock) and (not settings.SAFE_MODE),
+        "read_only": bool(settings.SAFE_MODE) or (not bool(getattr(settings, "LIVE_TRADING_ENABLED", False))),
+        "live_trading_enabled": bool(getattr(settings, "LIVE_TRADING_ENABLED", False)),
+        # For UI purposes, SAFE_MODE and LIVE_TRADING_ENABLED should behave like "can't trade".
+        "can_trade": (not s.trade_lock) and (not settings.SAFE_MODE) and bool(getattr(settings, "LIVE_TRADING_ENABLED", False)),
         "trade_lock": s.trade_lock,
         "reason": s.reason,
         "safe_mode": bool(settings.SAFE_MODE),

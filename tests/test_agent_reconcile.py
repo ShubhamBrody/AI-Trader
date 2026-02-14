@@ -27,6 +27,7 @@ def test_reconcile_places_missing_sl(monkeypatch):
     # Force live upstox path but with fakes (no network)
     monkeypatch.setattr(settings_module.settings, "AUTOTRADER_BROKER", "upstox", raising=False)
     monkeypatch.setattr(settings_module.settings, "SAFE_MODE", False, raising=False)
+    monkeypatch.setattr(settings_module.settings, "LIVE_TRADING_ENABLED", True, raising=False)
     monkeypatch.setattr(settings_module.settings, "UPSTOX_USE_BROKER_STOP", True, raising=False)
     monkeypatch.setattr(settings_module.settings, "UPSTOX_FALLBACK_APP_STOP", True, raising=False)
 

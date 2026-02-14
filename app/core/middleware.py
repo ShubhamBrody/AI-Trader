@@ -90,6 +90,8 @@ class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
             admin_only = True
         if path in {"/api/agent/start", "/api/agent/stop", "/api/agent/flatten", "/api/agent/cancel-open-orders"}:
             admin_only = True
+        if path == "/api/prediction/retention/cleanup":
+            admin_only = True
 
         if protected:
             key = request.headers.get("x-api-key")

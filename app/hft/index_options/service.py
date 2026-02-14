@@ -5,7 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 from app.agent.state import list_open_trades, local_day_bounds_utc, mark_trade_closed, record_trade_open
@@ -23,10 +23,12 @@ from app.paper_trading.service import PaperTradingService
 from app.portfolio.service import PortfolioService
 from app.realtime.bus import publish_sync
 from app.strategy.engine import StrategyEngine
+from app.ai.engine import AIEngine
 
 from app.hft.index_options.calibration import snapshot as calib_snapshot
 from app.hft.index_options.calibration import update_on_trade_close
 from app.hft.index_options.selector import OptionContract, find_atm_option
+from app.ai.trend_confluence import confluence_policy
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,27 @@ def _safe_float(v: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _ai_pred_to_action(pred: dict[str, Any] | None) -> tuple[str, float, float, str | None]:
+    if not isinstance(pred, dict):
+        return "HOLD", 0.0, 1.0, None
+
+    raw_p = pred.get("prediction")
+    raw_m = pred.get("meta")
+    p: dict[str, Any] = cast(dict[str, Any], raw_p) if isinstance(raw_p, dict) else {}
+    m: dict[str, Any] = cast(dict[str, Any], raw_m) if isinstance(raw_m, dict) else {}
+
+    action = str(p.get("signal") or "HOLD").upper()
+    if action not in {"BUY", "SELL", "HOLD"}:
+        action = "HOLD"
+
+    conf = float(_safe_float(p.get("confidence"), 0.0) or 0.0)
+    unc = float(_safe_float(p.get("uncertainty"), 1.0) or 1.0)
+    model = m.get("model")
+    model_name = str(model) if isinstance(model, str) and model else None
+
+    return action, float(_clamp(conf, 0.0, 1.0)), float(_clamp(unc, 0.0, 1.0)), model_name
+
+
 class IndexOptionsHftService:
     """1m/5m index-options HFT loop.
 
@@ -76,6 +99,7 @@ class IndexOptionsHftService:
         self._strategy = StrategyEngine()
         self._paper = PaperTradingService()
         self._portfolio = PortfolioService()
+        self._ai = AIEngine()
 
         # Track last processed candle timestamp per (underlying, interval)
         self._last_ts: dict[tuple[str, str], int] = {}
@@ -131,8 +155,10 @@ class IndexOptionsHftService:
             return {"ok": False, "detail": "stop the HFT loop before switching broker"}
 
         if b == "upstox":
-            if bool(settings.SAFE_MODE):
-                return {"ok": False, "detail": "SAFE_MODE=true: live trading disabled"}
+            if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+                return {"ok": False, "detail": "LIVE_TRADING_ENABLED=false: live orders disabled"}
+            if settings.SAFE_MODE:
+                return {"ok": False, "detail": "SAFE_MODE=true: live orders disabled"}
             if not token_store.is_logged_in():
                 return {"ok": False, "detail": "Upstox not authenticated. Open /api/auth/upstox/login"}
 
@@ -147,6 +173,23 @@ class IndexOptionsHftService:
         today_bounds = self._today_bounds_utc()
         trades_today = self._count_trades_today_hft(bounds=today_bounds)
         pnl_today = self._realized_pnl_today_hft(bounds=today_bounds)
+
+        ai_gate: dict[str, Any] = {
+            "enabled": bool(getattr(settings, "INDEX_OPTIONS_HFT_AI_GATE_ENABLED", False)),
+            "min_confidence": float(getattr(settings, "INDEX_OPTIONS_HFT_AI_MIN_CONFIDENCE", 0.60)),
+            "interval": str(getattr(settings, "INDEX_OPTIONS_HFT_AI_INTERVAL", "1m")),
+            "lookback_days": int(getattr(settings, "INDEX_OPTIONS_HFT_AI_LOOKBACK_DAYS", 7)),
+            "horizon_steps": int(getattr(settings, "INDEX_OPTIONS_HFT_AI_HORIZON_STEPS", 12)),
+        }
+
+        trend_confluence: dict[str, Any] = {
+            "enabled": bool(getattr(settings, "INDEX_OPTIONS_HFT_TREND_CONFLUENCE_ENABLED", False)),
+            "daily_days": int(getattr(settings, "TRADER_TREND_CONFLUENCE_DAILY_DAYS", 420)),
+            "h4_days": int(getattr(settings, "TRADER_TREND_CONFLUENCE_H4_DAYS", 90)),
+            "h1_days": int(getattr(settings, "TRADER_TREND_CONFLUENCE_H1_DAYS", 30)),
+            "weights": {"1d": 3, "4h": 2, "1h": 1},
+            "strategy": "ma_macd_rsi_adx_volume_mtf_v1",
+        }
         return {
             "running": self._status.running,
             "started_ts": self._status.started_ts,
@@ -155,6 +198,8 @@ class IndexOptionsHftService:
             "enabled": bool(getattr(settings, "INDEX_OPTIONS_HFT_ENABLED", False)),
             "broker": broker,
             "calibration": calib_snapshot(path=str(getattr(settings, "INDEX_OPTIONS_HFT_STATE_PATH", "data/hft_index_options_state.json"))),
+            "ai_gate": ai_gate,
+            "trend_confluence": trend_confluence,
             "open_trades": int(open_hft),
             "trades_today": int(trades_today),
             "pnl_today": float(pnl_today),
@@ -172,7 +217,11 @@ class IndexOptionsHftService:
         self._status.started_ts = _now_ts()
         self._status.last_error = None
         self._task = asyncio.create_task(self._run_loop())
-        publish_sync("hft", "hft.start", {"broker": str(self.broker()), "safe_mode": bool(settings.SAFE_MODE)})
+        publish_sync(
+            "hft",
+            "hft.start",
+            {"broker": str(self.broker()), "safe_mode": bool(settings.SAFE_MODE), "live_trading_enabled": bool(getattr(settings, "LIVE_TRADING_ENABLED", False))},
+        )
         log_event("hft.index_options.start", {"broker": str(self.broker())})
         return {"ok": True}
 
@@ -345,6 +394,116 @@ class IndexOptionsHftService:
         if require_market_alignment and str(market.get("action")) != action:
             return None
 
+        # Optional AI gate: require AIEngine to agree with the trade direction and meet a confidence floor.
+        ai_gate_enabled = bool(getattr(settings, "INDEX_OPTIONS_HFT_AI_GATE_ENABLED", False))
+        ai_info: dict[str, Any] | None = None
+        if ai_gate_enabled:
+            ai_interval = str(getattr(settings, "INDEX_OPTIONS_HFT_AI_INTERVAL", "1m"))
+            ai_lookback_days = int(getattr(settings, "INDEX_OPTIONS_HFT_AI_LOOKBACK_DAYS", 7))
+            ai_horizon_steps = int(getattr(settings, "INDEX_OPTIONS_HFT_AI_HORIZON_STEPS", 12))
+            ai_min_conf = float(getattr(settings, "INDEX_OPTIONS_HFT_AI_MIN_CONFIDENCE", 0.60))
+
+            try:
+                ai_pred = cast(
+                    dict[str, Any],
+                    self._ai.predict(
+                    instrument_key=str(spot_key),
+                    interval=str(ai_interval),
+                    lookback_days=max(1, int(ai_lookback_days)),
+                    horizon_steps=max(1, int(ai_horizon_steps)),
+                    include_nifty=False,
+                    model_family="intraday",
+                    ),
+                )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "underlying": sym,
+                    "action": action,
+                    "confidence": conf,
+                    "reason": "ai_gate_error",
+                    "ai_error": str(e),
+                    "spot_instrument_key": spot_key,
+                    "spot": spot,
+                    "signal_1m": sig1,
+                    "signal_5m": sig5,
+                }
+
+            ai_action, ai_conf, ai_unc, ai_model = _ai_pred_to_action(ai_pred)
+            ai_info = {
+                "action": ai_action,
+                "confidence": float(ai_conf),
+                "uncertainty": float(ai_unc),
+                "model": ai_model,
+                "interval": str(ai_interval),
+                "lookback_days": int(ai_lookback_days),
+                "horizon_steps": int(ai_horizon_steps),
+                "min_confidence": float(ai_min_conf),
+            }
+
+            if ai_action == "HOLD":
+                return {
+                    "ok": False,
+                    "underlying": sym,
+                    "action": action,
+                    "confidence": conf,
+                    "reason": "ai_hold",
+                    "ai": ai_info,
+                    "spot_instrument_key": spot_key,
+                    "spot": spot,
+                }
+
+            if ai_action != action:
+                return {
+                    "ok": False,
+                    "underlying": sym,
+                    "action": action,
+                    "confidence": conf,
+                    "reason": "ai_disagrees",
+                    "ai": ai_info,
+                    "spot_instrument_key": spot_key,
+                    "spot": spot,
+                }
+
+            if float(ai_conf) < float(ai_min_conf):
+                return {
+                    "ok": False,
+                    "underlying": sym,
+                    "action": action,
+                    "confidence": conf,
+                    "reason": "ai_low_confidence",
+                    "ai": ai_info,
+                    "spot_instrument_key": spot_key,
+                    "spot": spot,
+                }
+
+        # Optional: multi-timeframe confluence (trend regime) gate + risk scaling.
+        trend_confluence: dict[str, Any] | None = None
+        confluence_risk_mult = 1.0
+        policy_reason: str | None = None
+        if bool(getattr(settings, "INDEX_OPTIONS_HFT_TREND_CONFLUENCE_ENABLED", False)):
+            try:
+                trend_confluence = cast(dict[str, Any], self._ai.analyze_trend_confluence(str(spot_key)))
+                pol = confluence_policy(intended_action=cast(Any, action), confluence=trend_confluence)
+                policy_reason = str(pol.reason)
+                if pol.action == "HOLD":
+                    return {
+                        "ok": False,
+                        "underlying": sym,
+                        "action": action,
+                        "confidence": conf,
+                        "reason": "confluence_gate",
+                        "trend_confluence": trend_confluence,
+                        "policy": {"reason": pol.reason},
+                        "spot_instrument_key": spot_key,
+                        "spot": spot,
+                    }
+                confluence_risk_mult = float(pol.risk_multiplier)
+            except Exception:
+                trend_confluence = None
+                confluence_risk_mult = 1.0
+                policy_reason = None
+
         opt_type = "CE" if action == "BUY" else "PE"
         contract = find_atm_option(
             underlying_symbol=sym,
@@ -396,6 +555,20 @@ class IndexOptionsHftService:
         max_cap = float(getattr(settings, "INDEX_OPTIONS_HFT_MAX_CAPITAL_PER_TRADE_INR", 5000.0))
         risk_budget = min(risk_budget, max_cap)
 
+        # Let AI adjust risk sizing (capital at risk) without changing the base risk configuration.
+        # This makes the AI responsible for "how much risk to take" while keeping the system safe-by-default.
+        ai_risk_mult = 1.0
+        if ai_info is not None:
+            try:
+                aconf = float(ai_info.get("confidence") or 0.0)
+                aunc = float(ai_info.get("uncertainty") or 1.0)
+                score = float(_clamp(aconf * (1.0 - aunc), 0.0, 1.0))
+                ai_risk_mult = float(_clamp(0.25 + 0.75 * score, 0.10, 1.0))
+            except Exception:
+                ai_risk_mult = 1.0
+        risk_budget = float(risk_budget) * float(ai_risk_mult)
+        risk_budget = float(risk_budget) * float(confluence_risk_mult)
+
         per_lot_cost = float(opt_price) * float(lot_size)
         if per_lot_cost <= 0:
             return None
@@ -420,6 +593,17 @@ class IndexOptionsHftService:
         # Stops/targets in option premium space.
         sl_pct = float(getattr(settings, "INDEX_OPTIONS_HFT_OPTION_STOP_PCT", 0.12))
         tp_pct = float(getattr(settings, "INDEX_OPTIONS_HFT_OPTION_TARGET_PCT", 0.18))
+
+        # Optional: AI influences stop/target intensity slightly (still bounded by clamps).
+        if ai_info is not None:
+            try:
+                aconf = float(ai_info.get("confidence") or 0.0)
+                aunc = float(ai_info.get("uncertainty") or 1.0)
+                score = float(_clamp(aconf * (1.0 - aunc), 0.0, 1.0))
+                sl_pct = float(sl_pct) * float(_clamp(0.90 + 0.20 * aunc, 0.75, 1.25))
+                tp_pct = float(tp_pct) * float(_clamp(0.80 + 0.50 * score, 0.60, 1.40))
+            except Exception:
+                pass
         stop = float(opt_price) * (1.0 - _clamp(sl_pct, 0.01, 0.95))
         target = float(opt_price) * (1.0 + _clamp(tp_pct, 0.01, 2.0))
 
@@ -443,6 +627,13 @@ class IndexOptionsHftService:
                 "market": market,
                 "confidence": conf,
                 "min_confidence": min_conf,
+                "ai": ai_info,
+                "ai_gate_enabled": bool(ai_gate_enabled),
+                "ai_risk_multiplier": float(ai_risk_mult),
+                "trend_confluence": (trend_confluence if isinstance(trend_confluence, dict) else None),
+                "trend_confluence_risk_multiplier": float(confluence_risk_mult),
+                "stop_pct": float(sl_pct),
+                "target_pct": float(tp_pct),
             },
         )
 
@@ -462,6 +653,12 @@ class IndexOptionsHftService:
             "stop": float(stop),
             "target": float(target),
             "placed": placed,
+            "ai": ai_info,
+            "ai_gate_enabled": bool(ai_gate_enabled),
+            "ai_risk_multiplier": float(ai_risk_mult),
+            "trend_confluence": (trend_confluence if isinstance(trend_confluence, dict) else None),
+            "trend_confluence_risk_multiplier": float(confluence_risk_mult),
+            "policy": ({"reason": policy_reason} if policy_reason else None),
         }
 
     def _today_bounds_utc(self) -> tuple[int, int]:
@@ -522,7 +719,8 @@ class IndexOptionsHftService:
         highs = [float(c.high) for c in candles]
         lows = [float(c.low) for c in candles]
         closes = [float(c.close) for c in candles]
-        idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes)
+        volumes = [float(getattr(c, "volume", 0.0) or 0.0) for c in candles]
+        idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes, volumes=volumes)
         action = str(idea.side).upper()
 
         if action == "HOLD":
@@ -548,7 +746,36 @@ class IndexOptionsHftService:
         }
 
     async def _option_last_price(self, option_instrument_key: str) -> float | None:
-        series = await asyncio.to_thread(self._candles.poll_intraday, option_instrument_key, "1m", 120)
+        instrument_key = str(option_instrument_key or "").strip()
+        if not instrument_key:
+            return None
+
+        # If Live broker enabled, prefer Upstox quote (fast + truly live).
+        if self.broker() == "upstox":
+            try:
+                cfg = UpstoxConfig(base_url=settings.UPSTOX_BASE_URL, hft_base_url=settings.UPSTOX_HFT_BASE_URL)
+                client = UpstoxClient(cfg)
+                try:
+                    payload = client.market_quote_quotes_v2([instrument_key])
+                finally:
+                    client.close()
+
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict):
+                    for v in data.values():
+                        if not isinstance(v, dict):
+                            continue
+                        if str(v.get("instrument_token") or "").strip() != instrument_key:
+                            continue
+                        lp = v.get("last_price")
+                        if lp is None:
+                            continue
+                        return float(lp)
+            except Exception:
+                # Fall back to candles cache.
+                pass
+
+        series = await asyncio.to_thread(self._candles.poll_intraday, instrument_key, "1m", 120)
         candles = list(series.candles or [])
         if not candles:
             return None
@@ -576,6 +803,8 @@ class IndexOptionsHftService:
         tag = f"hft:index_options:{symbol}"
 
         if broker == "upstox":
+            if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+                return {"ok": False, "detail": "LIVE_TRADING_ENABLED=false: live orders disabled"}
             if settings.SAFE_MODE:
                 return {"ok": False, "detail": "SAFE_MODE=true: live orders disabled"}
             token = str(contract.upstox_token or "").strip()
@@ -616,7 +845,7 @@ class IndexOptionsHftService:
                 entry=float(entry_price),
                 stop=float(stop),
                 target=float(target),
-                entry_order_id=None,
+                entry_order_id=str(state_id),
                 sl_order_id=None,
                 monitor_app_stop=False,
                 meta=meta,
@@ -716,24 +945,68 @@ class IndexOptionsHftService:
 
         broker: BrokerName = self.broker()
         if broker == "upstox":
-            # For now, we only record close; live exit wiring can be expanded similarly to entry.
-            # Guarded by SAFE_MODE.
+            if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+                return
             if settings.SAFE_MODE:
                 return
 
-        # Paper exit
-        self._paper.execute(symbol=instrument_key, side="SELL", qty=float(qty), price=float(price))
-        create_order(
-            broker="paper",
-            instrument_key=instrument_key,
-            side="SELL",
-            qty=float(qty),
-            order_kind="EXIT",
-            order_type="PAPER",
-            price=float(price),
-            status="FILLED",
-            meta={"reason": reason, "origin": "hft_index_options"},
-        )
+            # Resolve Upstox instrument_token from DB.
+            token: str | None = None
+            try:
+                with db_conn() as conn:
+                    row = conn.execute(
+                        "SELECT upstox_token FROM instrument_meta WHERE instrument_key=? LIMIT 1",
+                        (str(instrument_key),),
+                    ).fetchone()
+                    token = None if row is None else (str(row["upstox_token"]) if row["upstox_token"] is not None else None)
+            except Exception:
+                token = None
+            token = (str(token).strip() if token is not None else "") or None
+            if not token:
+                return
+
+            tag = f"hft:index_options:{instrument_key}"
+            exit_client_id = f"hft-io-exit-{instrument_key}-{_now_ts()}"
+            body = build_equity_intraday_market_order(instrument_token=token, side="SELL", qty=int(qty), tag=tag)
+
+            state_id = create_order(
+                broker="upstox",
+                instrument_key=instrument_key,
+                side="SELL",
+                qty=float(qty),
+                order_kind="EXIT",
+                order_type="MARKET",
+                client_order_id=exit_client_id,
+                status="NEW",
+                meta={"tag": tag, "body": body, "reason": reason, "origin": "hft_index_options", "idempotency": {"client_order_id": exit_client_id}},
+            )
+
+            cfg = UpstoxConfig(base_url=settings.UPSTOX_BASE_URL, hft_base_url=settings.UPSTOX_HFT_BASE_URL)
+            client = UpstoxClient(cfg)
+            try:
+                res = client.place_order_v3(body)
+                order_id = str((res.get("data") or {}).get("order_id") or "") or None
+                update_order(state_id, status="SUBMITTED", broker_order_id=order_id, meta_patch={"upstox": {"place": res}})
+            except UpstoxError as e:
+                update_order(state_id, status="ERROR", last_error=str(e)[:500], meta_patch={"error": str(e)})
+                raise
+            finally:
+                client.close()
+
+        else:
+            # Paper exit
+            self._paper.execute(symbol=instrument_key, side="SELL", qty=float(qty), price=float(price))
+            create_order(
+                broker="paper",
+                instrument_key=instrument_key,
+                side="SELL",
+                qty=float(qty),
+                order_kind="EXIT",
+                order_type="PAPER",
+                price=float(price),
+                status="FILLED",
+                meta={"reason": reason, "origin": "hft_index_options"},
+            )
 
         # Update trade + calibration.
         entry = float(trade.get("entry") or 0.0)

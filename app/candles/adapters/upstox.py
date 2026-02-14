@@ -184,6 +184,7 @@ def fetch_candles(instrument_key: str, interval: str, start: datetime, end: date
             interval_seconds = {
                 "1d": 24 * 3600,
                 "1h": 3600,
+                "4h": 14400,
                 "30m": 1800,
                 "15m": 900,
                 "5m": 300,

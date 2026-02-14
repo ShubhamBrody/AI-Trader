@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Query
 
 from app.ai.engine import AIEngine
+from app.core.settings import settings
 
 router = APIRouter(prefix="/ai")
 engine = AIEngine()
@@ -16,12 +17,19 @@ def predict(
     include_nifty: bool = Query(False),
 ) -> dict:
     # BackendComplete + frontend contract: flattened keys.
+    # Default to next-hour style prediction from intraday models.
+    interval = str(getattr(settings, "PREDICTOR_INTERVAL", "1m") or "1m")
+    horizon_steps = int(getattr(settings, "PREDICTOR_HORIZON_STEPS", 60) or 60)
+    # Keep lookback modest for API calls; trained models can still be loaded from the registry/DB.
+    lookback_days = int(getattr(settings, "INDEX_OPTIONS_HFT_AI_LOOKBACK_DAYS", 7) or 7)
+
     raw = engine.predict(
         instrument_key=instrument_key,
-        interval="1d",
-        lookback_days=60,
-        horizon_steps=1,
+        interval=interval,
+        lookback_days=max(1, int(lookback_days)),
+        horizon_steps=max(1, int(horizon_steps)),
         include_nifty=include_nifty,
+        model_family="intraday" if str(interval).endswith("m") else None,
     )
 
     pred = (raw.get("prediction") or {}) if isinstance(raw, dict) else {}
@@ -33,10 +41,15 @@ def predict(
     uncertainty = pred.get("uncertainty") if isinstance(pred, dict) else None
     agreement = pred.get("ensemble_agreement") if isinstance(pred, dict) else None
     model_name = meta.get("model") if isinstance(meta, dict) else None
+    model_family = meta.get("model_family") if isinstance(meta, dict) else None
     data_quality = meta.get("data_quality") if isinstance(meta, dict) else None
+
+    model_source = "fallback" if str(model_name or "").startswith("rules_") else ("trained" if model_name else "unknown")
 
     reasons = [
         f"Model={model_name}" if model_name else "Model=unknown",
+        f"Family={model_family}" if model_family else "Family=unknown",
+        f"Source={model_source}",
         f"DataQuality={data_quality:.2f}" if isinstance(data_quality, (int, float)) else "DataQuality=unknown",
     ]
     if isinstance(action, str):

@@ -19,7 +19,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 @router.get("")
-def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 220) -> dict:
+def strategy_signal(
+    instrument_key: str,
+    interval: str = "1m",
+    lookback: int = 220,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    long_only: bool = False,
+) -> dict:
     """Returns a deterministic strategy signal used by the frontend.
 
     Response keys are chosen to match the UI: action, confidence, entry, stop_loss, target, regime.
@@ -35,6 +42,13 @@ def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 2
     svc = CandleService()
 
     now = datetime.now(timezone.utc)
+
+    def _ensure_aware(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    end_dt = _ensure_aware(end) if end is not None else now
 
     # Heuristic window: aim to cover the required lookback with slack for gaps.
     interval_s = str(interval).lower().strip()
@@ -54,17 +68,21 @@ def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 2
         # daily/unknown
         span = timedelta(days=max(30, max(1, lookback // 5)))
 
-    start = now - span
+    start_dt = _ensure_aware(start) if start is not None else (end_dt - span)
 
     candles: list = []
     # Prefer historical range (auto-warms). If it is still empty and market is live, try a short poll.
     try:
-        series = svc.get_historical(ik, interval, start=start, end=now, limit=lookback)
+        series = svc.get_historical(ik, interval, start=start_dt, end=end_dt, limit=lookback)
         candles = list(series.candles or [])
     except Exception:
         candles = []
 
-    if len(candles) < 60:
+    # Only poll intraday when asking for "near-now" signals.
+    # If the UI is requesting a historical end time, polling would mix in fresh candles
+    # and make overlays look inconsistent.
+    should_poll_intraday = end is None or abs((now - end_dt).total_seconds()) < (15 * 60)
+    if len(candles) < 60 and should_poll_intraday:
         try:
             series = svc.poll_intraday(ik, interval, lookback_minutes=int(span.total_seconds() // 60))
             candles = list(series.candles or [])
@@ -76,7 +94,7 @@ def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 2
     if len(candles) < 60 and str(interval).lower().strip() != "1d":
         try:
             tz = ZoneInfo(settings.TIMEZONE)
-            now_local = datetime.now(timezone.utc).astimezone(tz)
+            now_local = end_dt.astimezone(tz)
 
             holidays = load_holidays("app/config/nse_holidays.yaml")
             last_day = last_n_trading_days(now_local.date(), 1, holidays)[0]
@@ -111,18 +129,33 @@ def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 2
     highs = [float(c.high) for c in candles]
     lows = [float(c.low) for c in candles]
     closes = [float(c.close) for c in candles]
+    volumes = [float(getattr(c, "volume", 0.0) or 0.0) for c in candles]
 
     engine = StrategyEngine()
-    idea = engine.build_idea(symbol=ik, highs=highs, lows=lows, closes=closes)
+    idea = engine.build_idea(symbol=ik, highs=highs, lows=lows, closes=closes, volumes=volumes)
 
-    action = str(idea.side).upper()
+    side = str(idea.side or "HOLD").lower().strip()
+    entry = float(idea.entry)
+    stop_loss = float(idea.stop_loss)
+    target = float(idea.target)
+
+    # Candles page is used as an "intraday plan" view for many users; to avoid confusion,
+    # we optionally force BUY semantics (SL below entry, target above entry) even when the
+    # engine emits a SELL idea.
+    if long_only and side == "sell" and all(map(math.isfinite, [entry, stop_loss, target])):
+        stop_dist = abs(stop_loss - entry)
+        target_dist = abs(entry - target)
+        stop_loss = entry - stop_dist
+        target = entry + target_dist
+        side = "buy"
+
+    rr = abs(target - entry) / max(abs(entry - stop_loss), 1e-9)
+    action = side.upper() if side in {"buy", "sell", "hold"} else "HOLD"
 
     # Best-effort confidence heuristic.
     if action == "HOLD":
         confidence = 0.30
     else:
-        # Use R/R as signal strength.
-        rr = float(idea.rr or 0.0)
         confidence = 0.55 + _clamp((rr - 1.0) / 4.0, 0.0, 0.40)
 
     # Regime is a friendly label for the UI.
@@ -133,10 +166,10 @@ def strategy_signal(instrument_key: str, interval: str = "1m", lookback: int = 2
         "interval": str(interval),
         "action": action,
         "confidence": _clamp(float(confidence), 0.0, 0.99),
-        "entry": float(idea.entry),
-        "stop_loss": float(idea.stop_loss),
-        "target": float(idea.target),
-        "rr": float(idea.rr),
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target": target,
+        "rr": float(rr),
         "regime": regime,
         "reason": idea.reason,
     }

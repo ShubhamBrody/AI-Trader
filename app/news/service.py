@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import html as _html
 import math
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
+
+import httpx
 
 from app.core.db import db_conn
 from app.core.settings import settings
@@ -13,6 +17,28 @@ from app.core.settings import settings
 
 _POS = {"surge", "gain", "beats", "record", "growth", "up", "rally", "strong", "bull", "profit"}
 _NEG = {"fall", "drops", "miss", "loss", "down", "weak", "bear", "fraud", "probe", "crash"}
+
+
+_NEWS_AI_CACHE_TTL_SECONDS = 120
+
+
+_AI_ENGINE_SINGLETON = None
+
+
+def _get_ai_engine():
+    global _AI_ENGINE_SINGLETON
+    if _AI_ENGINE_SINGLETON is None:
+        from app.ai.engine import AIEngine
+
+        _AI_ENGINE_SINGLETON = AIEngine()
+    return _AI_ENGINE_SINGLETON
+
+
+@lru_cache(maxsize=4096)
+def _ai_predict_cached(instrument_key: str, interval: str, horizon_steps: int, bucket: int) -> dict:
+    _ = bucket  # cache-busting TTL bucket
+    eng = _get_ai_engine()
+    return eng.predict(instrument_key, interval=interval, horizon_steps=int(horizon_steps))
 
 
 def _safe_sentiment(title: str, summary: str | None) -> float:
@@ -55,6 +81,195 @@ class NewsItem:
 
 
 class NewsService:
+    def _impact_label(self, impact: float) -> str:
+        v = float(max(0.0, min(1.0, impact)))
+        if v >= 0.66:
+            return "HIGH"
+        if v >= 0.33:
+            return "MEDIUM"
+        return "LOW"
+
+    def _extract_text_from_html(self, html_text: str) -> str:
+        # Very lightweight (dependency-free) extraction.
+        # Remove scripts/styles, then strip tags.
+        s = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html_text or "")
+        s = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", s)
+        s = re.sub(r"(?is)<!--.*?-->", " ", s)
+        s = re.sub(r"(?is)<[^>]+>", " ", s)
+        s = _html.unescape(s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _fetch_article_text(self, url: str) -> str | None:
+        u = (url or "").strip()
+        if not u or not (u.startswith("http://") or u.startswith("https://")):
+            return None
+
+        try:
+            with httpx.Client(follow_redirects=True, timeout=6.0) as client:
+                r = client.get(
+                    u,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    },
+                )
+        except Exception:
+            return None
+
+        if r.status_code != 200:
+            return None
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "text/html" not in ctype and "application/xhtml" not in ctype:
+            return None
+
+        text = self._extract_text_from_html(r.text)
+        # Keep a reasonable chunk for the model.
+        if len(text) < 200:
+            return None
+        return text[:9000]
+
+    def _ollama_chat(self, messages: list[dict[str, str]]) -> str | None:
+        base = (settings.OLLAMA_BASE_URL or "").strip().rstrip("/")
+        if not base:
+            return None
+
+        payload: dict[str, Any] = {
+            "model": settings.OLLAMA_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 120,
+            },
+        }
+
+        try:
+            with httpx.Client(timeout=12.0) as client:
+                r = client.post(f"{base}/api/chat", json=payload)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            content = (((data or {}).get("message") or {}).get("content") or "").strip()
+            if not content:
+                return None
+            content = re.sub(r"\s+", " ", content).strip()
+            # Hard guard against runaway output.
+            return content[:500]
+        except Exception:
+            return None
+
+    def _get_cached_llm_summary(self, url: str) -> str | None:
+        u = (url or "").strip()
+        if not u:
+            return None
+        ttl_days = max(1, int(settings.NEWS_LLM_SUMMARY_TTL_DAYS or 7))
+        min_ts = int(time.time()) - ttl_days * 24 * 60 * 60
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT summary, created_ts FROM news_llm_summaries WHERE url=?",
+                (u,),
+            ).fetchone()
+            if not row:
+                return None
+            created_ts = int(row[1] or 0)
+            if created_ts < min_ts:
+                return None
+            s = (row[0] or "").strip()
+            return s or None
+
+    def _put_cached_llm_summary(self, *, url: str, summary: str, title: str | None, source: str | None) -> None:
+        u = (url or "").strip()
+        s = (summary or "").strip()
+        if not u or not s:
+            return
+        created_ts = int(time.time())
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO news_llm_summaries (url, summary, model, created_ts, title, source) VALUES (?, ?, ?, ?, ?, ?)",
+                (u, s, settings.OLLAMA_MODEL, created_ts, (title or None), (source or None)),
+            )
+
+    def llm_summary_for(self, *, title: str, url: str | None, rss_summary: str | None, source: str | None = None) -> str | None:
+        if not bool(settings.NEWS_LLM_SUMMARY_ENABLED):
+            return None
+
+        link = (url or "").strip()
+        if not link:
+            return None
+
+        cached = self._get_cached_llm_summary(link)
+        if cached is not None:
+            return cached
+
+        article_text = None
+        try:
+            article_text = self._fetch_article_text(link)
+        except Exception:
+            article_text = None
+
+        # Still allow summarization from RSS snippet if the article fetch fails.
+        snippet = (rss_summary or "").strip()
+        if not article_text and not snippet:
+            return None
+
+        sys = (
+            "You summarize business/market news for traders. "
+            "Write a concise plain-text summary in 1-2 sentences (<=45 words). "
+            "No bullet points, no hashtags, no advice."
+        )
+        user = (
+            f"Title: {title.strip()}\n"
+            f"Feed snippet: {snippet[:1200] if snippet else ''}\n"
+            f"Article text (may be partial): {(article_text or '')[:7000]}\n\n"
+            "Task: Summarize what this news is about in 1-2 sentences."
+        )
+        out = self._ollama_chat([
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ])
+
+        if out:
+            try:
+                self._put_cached_llm_summary(url=link, summary=out, title=title, source=source)
+            except Exception:
+                pass
+            return out
+
+        return None
+
+    def enrich_item_for_ui(self, it: dict[str, Any]) -> dict[str, Any]:
+        ts = int(it.get("ts") or 0)
+        title = str(it.get("title") or "")
+        url = (it.get("url") or "")
+        source = it.get("source")
+        impact = float(it.get("impact") or 0.0)
+
+        iso = None
+        try:
+            iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except Exception:
+            iso = None
+
+        llm = None
+        try:
+            llm = self.llm_summary_for(title=title, url=url, rss_summary=(it.get("summary") or None), source=source)
+        except Exception:
+            llm = None
+
+        return {
+            **it,
+            # Fields used by frontend cards
+            "id": f"news:{url}" if url else f"news:{ts}:{abs(hash(title))}",
+            "timestamp": iso,
+            "published_at": iso,
+            "region": None,
+            "impact_score": impact,
+            "impact_label": self._impact_label(impact),
+            # Prefer LLM summary when available; fall back to RSS snippet.
+            "summary_text": (llm or it.get("summary") or None),
+        }
+
     def _tag_macro(self, title: str, summary: str | None) -> list[str]:
         text = f"{title} {summary or ''}".lower()
         tags: list[str] = []
@@ -72,6 +287,68 @@ class NewsService:
             if any(n in text for n in needles):
                 tags.append(tag)
         return tags
+
+    def _ai_sentiment_from_mentions(self, mentions: list[dict[str, Any]], *, interval: str = "1d") -> tuple[float, float] | None:
+        """Compute sentiment/impact using AI forecasts for mentioned instruments.
+
+        Returns:
+            (sentiment, impact) in [-1, 1] x [0, 1], or None if unavailable.
+        """
+
+        if not mentions:
+            return None
+
+        # Keep this conservative: score only a few most relevant mentions.
+        ranked = sorted(mentions, key=lambda m: -float(m.get("relevance") or 0.0))
+        ranked = [m for m in ranked if (m.get("instrument_key") or "").strip()][:4]
+        if not ranked:
+            return None
+
+        bucket = int(time.time() // int(_NEWS_AI_CACHE_TTL_SECONDS))
+
+        sent_sum = 0.0
+        impact_sum = 0.0
+        weight_sum = 0.0
+
+        for m in ranked:
+            ik = str(m.get("instrument_key") or "").strip()
+            w = float(m.get("relevance") or 0.0)
+            if not ik or w <= 0:
+                continue
+
+            try:
+                pred = _ai_predict_cached(ik, interval, 1, bucket)
+                feats = pred.get("features") or {}
+                last_close = float(feats.get("last_close") or 0.0)
+                next_close = float((((pred.get("prediction") or {}).get("next_hour_ohlc") or {}).get("close")) or 0.0)
+                if last_close <= 0 or next_close <= 0:
+                    continue
+
+                ret = (next_close / last_close) - 1.0
+
+                # Map return into [-1, 1] smoothly.
+                s = float(max(-1.0, min(1.0, math.tanh(ret * 50.0))))
+
+                p = pred.get("prediction") or {}
+                conf = float(p.get("confidence") or 0.0)
+                unc = float(p.get("uncertainty") or 1.0)
+                strength = float(max(0.0, min(1.0, conf * (1.0 - unc))))
+
+                # Impact favors agreement/strength and magnitude.
+                imp = float(max(0.0, min(1.0, 0.6 * abs(s) + 0.4 * strength)))
+
+                sent_sum += s * w
+                impact_sum += imp * w
+                weight_sum += w
+            except Exception:
+                continue
+
+        if weight_sum <= 0:
+            return None
+
+        sentiment = float(sent_sum / weight_sum)
+        impact = float(max(0.0, min(1.0, impact_sum / weight_sum)))
+        return (sentiment, impact)
 
     @lru_cache(maxsize=1)
     def _instrument_lookup_cache(self) -> dict[str, Any]:
@@ -238,6 +515,78 @@ class NewsService:
                         continue
         return {"ok": True, "scanned": scanned, "inserted": inserted}
 
+    def rescore_recent(self, *, limit_news: int = 300, interval: str = "1d") -> dict[str, Any]:
+        """Recompute sentiment/impact for the latest N news items.
+
+        Uses AI-first scoring from extracted mentions. Falls back to keyword heuristic.
+        """
+
+        limit_news = max(1, min(int(limit_news), 5000))
+        interval = (interval or "1d").strip() or "1d"
+
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, title, summary, sentiment, impact FROM news_items ORDER BY ts DESC LIMIT ?",
+                (limit_news,),
+            ).fetchall()
+
+        scanned = 0
+        updated = 0
+        unchanged = 0
+        failed = 0
+
+        with db_conn() as conn:
+            for r in rows:
+                scanned += 1
+                try:
+                    news_id = int(r[0])
+                    title = str(r[1] or "")
+                    summary = r[2]
+
+                    mentions: list[dict[str, Any]] = []
+                    try:
+                        mentions = self._extract_mentions(title, summary)
+                    except Exception:
+                        mentions = []
+
+                    ai_scored = None
+                    try:
+                        ai_scored = self._ai_sentiment_from_mentions(mentions, interval=interval)
+                    except Exception:
+                        ai_scored = None
+
+                    if ai_scored is not None:
+                        sent, imp = ai_scored
+                    else:
+                        sent = _safe_sentiment(title, summary)
+                        imp = _impact(sent, title)
+
+                    prev_sent = float(r[3] or 0.0)
+                    prev_imp = float(r[4] or 0.0)
+
+                    # Avoid churn from tiny float differences.
+                    if abs(prev_sent - float(sent)) < 1e-6 and abs(prev_imp - float(imp)) < 1e-6:
+                        unchanged += 1
+                        continue
+
+                    conn.execute(
+                        "UPDATE news_items SET sentiment=?, impact=? WHERE id=?",
+                        (float(sent), float(imp), news_id),
+                    )
+                    updated += 1
+                except Exception:
+                    failed += 1
+                    continue
+
+        return {
+            "ok": True,
+            "scanned": scanned,
+            "updated": updated,
+            "unchanged": unchanged,
+            "failed": failed,
+            "interval": interval,
+        }
+
     def for_query(self, query: str, *, limit: int = 80, min_ts: int | None = None) -> dict[str, Any]:
         """Return news items relevant to a symbol/theme/instrument_key."""
         q = (query or "").strip()
@@ -298,8 +647,26 @@ class NewsService:
             summary = f"[{instrument_key}] {summary}"
 
         ts = int(datetime.now(timezone.utc).timestamp())
-        sent = _safe_sentiment(title, summary)
-        impact = _impact(sent, title)
+
+        mentions: list[dict[str, Any]] = []
+        if instrument_key:
+            mentions.append({"instrument_key": instrument_key, "relevance": 1.0, "reason": "hint"})
+        try:
+            mentions.extend(self._extract_mentions(title, summary))
+        except Exception:
+            pass
+
+        ai_scored = None
+        try:
+            ai_scored = self._ai_sentiment_from_mentions(mentions, interval="1d")
+        except Exception:
+            ai_scored = None
+
+        if ai_scored is not None:
+            sent, impact = ai_scored
+        else:
+            sent = _safe_sentiment(title, summary)
+            impact = _impact(sent, title)
 
         with db_conn() as conn:
             cur = conn.execute("SELECT id FROM news_items WHERE url=?", (link,))
@@ -312,7 +679,6 @@ class NewsService:
 
             # Best-effort mentions capture
             try:
-                mentions = self._extract_mentions(title, summary)
                 for m in mentions:
                     conn.execute(
                         "INSERT OR IGNORE INTO news_mentions (news_url, instrument_key, relevance, reason, created_ts) VALUES (?, ?, ?, ?, ?)",
@@ -400,6 +766,19 @@ class NewsService:
                 sent = _safe_sentiment(title, summary)
                 impact = _impact(sent, title)
 
+                mentions: list[dict[str, Any]] = []
+                try:
+                    mentions = self._extract_mentions(title, summary)
+                except Exception:
+                    mentions = []
+
+                try:
+                    ai_scored = self._ai_sentiment_from_mentions(mentions, interval="1d")
+                    if ai_scored is not None:
+                        sent, impact = ai_scored
+                except Exception:
+                    pass
+
                 with db_conn() as conn:
                     # Deduplicate by url
                     cur = conn.execute("SELECT id FROM news_items WHERE url=?", (link,))
@@ -410,7 +789,6 @@ class NewsService:
                         (ts, source, title, link, summary, float(sent), float(impact)),
                     )
                     try:
-                        mentions = self._extract_mentions(title, summary)
                         for m in mentions:
                             conn.execute(
                                 "INSERT OR IGNORE INTO news_mentions (news_url, instrument_key, relevance, reason, created_ts) VALUES (?, ?, ?, ?, ?)",

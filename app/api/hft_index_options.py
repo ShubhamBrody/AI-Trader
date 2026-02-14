@@ -13,6 +13,7 @@ from app.hft.index_options.service import HFT_INDEX_OPTIONS
 from app.hft.index_options.selector import list_option_chain, find_nearest_future
 from app.candles.service import CandleService
 from app.realtime.bus import publish_sync
+from app.integrations.upstox.client import UpstoxClient, UpstoxConfig, UpstoxError
 
 router = APIRouter(prefix="/hft/index-options", tags=["hft"])
 
@@ -31,6 +32,48 @@ def _last_close_from_db(instrument_key: str, interval: str = "1m") -> float | No
             return float(row["close"]) if row["close"] is not None else None
     except Exception:
         return None
+
+
+def _upstox_last_price_map(instrument_keys: list[str]) -> dict[str, float]:
+    """Best-effort live last_price for instrument_key -> ltp.
+
+    Uses Upstox market quote endpoint. Returns {} on any error.
+    """
+
+    keys = [str(k).strip() for k in (instrument_keys or []) if str(k).strip()]
+    if not keys:
+        return {}
+
+    cfg = UpstoxConfig(base_url=settings.UPSTOX_BASE_URL, hft_base_url=settings.UPSTOX_HFT_BASE_URL)
+    client: UpstoxClient | None = None
+    try:
+        client = UpstoxClient(cfg)
+        payload = client.market_quote_quotes_v2(keys)
+    except Exception:
+        return {}
+    finally:
+        if client is not None:
+            client.close()
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return {}
+
+    out: dict[str, float] = {}
+    for v in data.values():
+        if not isinstance(v, dict):
+            continue
+        ik = str(v.get("instrument_token") or "").strip()
+        if not ik:
+            continue
+        lp = v.get("last_price")
+        if lp is None:
+            continue
+        try:
+            out[ik] = float(lp)
+        except Exception:
+            continue
+    return out
 
 
 class TradeRiskUpdate(BaseModel):
@@ -163,36 +206,47 @@ def options_chain(underlying: str = "NIFTY", count: int = 7) -> dict[str, Any]:
     spot_query = getattr(settings, f"INDEX_OPTIONS_HFT_{sym}_SPOT_QUERY", sym)
     spot_key = CandleService._resolve_instrument_key(str(spot_query))
 
-    # IMPORTANT: keep this endpoint non-blocking and fast.
-    # Do NOT call poll_intraday() here (it may hit broker/network and hang).
+    # Prefer DB cache (fast). If missing, try Upstox quote (best-effort).
     spot = _last_close_from_db(spot_key, "1m") or _last_close_from_db(spot_key, "5m") or 0.0
     if spot <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail={"detail": "spot unavailable; warm candles cache first", "spot_instrument_key": spot_key},
-        )
+        spot_map = _upstox_last_price_map([spot_key])
+        spot = float(spot_map.get(spot_key) or 0.0)
+    if spot <= 0:
+        raise HTTPException(status_code=400, detail={"detail": "spot unavailable", "spot_instrument_key": spot_key})
 
     expiry, rows = list_option_chain(underlying_symbol=sym, spot=float(spot), strikes_each_side=int(count), max_expiry_days=int(getattr(settings, "INDEX_OPTIONS_HFT_MAX_EXPIRY_DAYS", 14)))
+
+    # Best-effort live LTP for the chain (independent of trading mode).
+    # Falls back to DB if quote call fails.
+    want_keys: list[str] = []
+    for r in rows:
+        if r.ce:
+            want_keys.append(str(r.ce.instrument_key))
+        if r.pe:
+            want_keys.append(str(r.pe.instrument_key))
+    live_prices = _upstox_last_price_map(want_keys)
 
     out_rows: list[dict[str, Any]] = []
     for r in rows:
         ce = None
         if r.ce:
+            ce_key = str(r.ce.instrument_key)
             ce = {
-                "instrument_key": r.ce.instrument_key,
+                "instrument_key": ce_key,
                 "tradingsymbol": r.ce.tradingsymbol,
                 "strike": r.ce.strike,
                 "option_type": "CE",
-                "ltp": _last_close_from_db(r.ce.instrument_key, "1m"),
+                "ltp": (live_prices.get(ce_key) if live_prices else None) or _last_close_from_db(ce_key, "1m"),
             }
         pe = None
         if r.pe:
+            pe_key = str(r.pe.instrument_key)
             pe = {
-                "instrument_key": r.pe.instrument_key,
+                "instrument_key": pe_key,
                 "tradingsymbol": r.pe.tradingsymbol,
                 "strike": r.pe.strike,
                 "option_type": "PE",
-                "ltp": _last_close_from_db(r.pe.instrument_key, "1m"),
+                "ltp": (live_prices.get(pe_key) if live_prices else None) or _last_close_from_db(pe_key, "1m"),
             }
         out_rows.append({"strike": float(r.strike), "ce": ce, "pe": pe})
 

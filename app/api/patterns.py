@@ -7,10 +7,13 @@ from pydantic import BaseModel, Field
 
 from app.ai.candlestick_patterns import CATALOG, detect_patterns, to_candles
 from app.ai.pattern_memory import apply_feedback, ensure_catalog_rows, get_stats, get_weights
+from app.ai.engine import AIEngine
 from app.candles.service import CandleService
 from app.core.settings import settings
 
 router = APIRouter(prefix="/patterns", tags=["patterns"])
+
+_ai = AIEngine()
 
 
 def _ensure() -> None:
@@ -84,26 +87,109 @@ def detect(
     _ensure()
     svc = CandleService()
     series = svc.poll_intraday(instrument_key, interval=interval, lookback_minutes=int(lookback_minutes))
-    cs = to_candles(series.candles or [])
-    weights = get_weights()
-    matches = detect_patterns(cs, weights=weights, max_results=max_results)
+    raw_candles = list(series.candles or [])
+
+    # Optional seq model: if enabled and available, prefer it for the primary output.
+    seq_used = False
+    matches: list[Any] = []
+    if bool(getattr(settings, "PATTERN_SEQ_MODEL_ENABLED", False)):
+        try:
+            from app.learning.pattern_seq import PATTERN_INDEX, torch_available, predict_patterns_from_candles
+
+            if torch_available():
+                model_path = str(getattr(settings, "PATTERN_SEQ_MODEL_PATH", "data/models/pattern_seq.pt"))
+                out = predict_patterns_from_candles(raw_candles, model_path=model_path, max_results=int(max_results))
+                if out.get("ok") and isinstance(out.get("top"), list):
+                    # Map seq probs back into catalog metadata.
+                    catalog_by_name = {p.name: p for p in CATALOG}
+                    seq_matches: list[dict[str, Any]] = []
+                    for row in list(out.get("top") or [])[: int(max_results)]:
+                        name = str(row.get("name") or "")
+                        prob = float(row.get("prob") or 0.0)
+                        p = catalog_by_name.get(name)
+                        if p is None:
+                            continue
+                        seq_matches.append(
+                            {
+                                "name": p.name,
+                                "family": p.family,
+                                "side": p.side,
+                                "window": int(getattr(p, "min_window", 0) or 0),
+                                "confidence": float(prob),
+                                "details": {"prob": float(prob), "source": "seq"},
+                            }
+                        )
+
+                    # Ensure deterministic ordering
+                    seq_matches.sort(key=lambda d: float(d.get("confidence") or 0.0), reverse=True)
+                    matches = seq_matches
+                    seq_used = True
+        except Exception:
+            seq_used = False
+
+    # Fallback: classic pattern detector + AI re-ranking.
+    if not seq_used:
+        cs = to_candles(raw_candles)
+        weights = get_weights()
+        matches = list(detect_patterns(cs, weights=weights, max_results=max_results))
+
+    # AI-first re-ranking: keep the same match objects, but prefer those
+    # whose side aligns with the current AI directional signal.
+    ai_side: str | None = None
+    try:
+        lb_days = 3 if str(interval).endswith("m") else 60
+        pred = _ai.predict(str(instrument_key), interval=str(interval), lookback_days=int(lb_days), horizon_steps=1)
+        sig = str((pred.get("prediction") or {}).get("signal") or "").upper()
+        if sig == "BUY":
+            ai_side = "buy"
+        elif sig == "SELL":
+            ai_side = "sell"
+        elif sig == "HOLD":
+            ai_side = "neutral"
+    except Exception:
+        ai_side = None
+
+    if (not seq_used) and ai_side in {"buy", "sell"} and matches:
+        def _score(m: Any) -> float:
+            c = float(getattr(m, "confidence", 0.0) or 0.0)
+            side = str(getattr(m, "side", "neutral") or "neutral").lower()
+            # Strong bonus when aligned; small penalty when opposed.
+            if side == ai_side:
+                return c * 1.20
+            if side in {"buy", "sell"} and side != ai_side:
+                return c * 0.92
+            return c
+
+        matches = sorted(list(matches), key=_score, reverse=True)
     return {
         "ok": True,
         "instrument_key": instrument_key,
         "interval": interval,
-        "n": len(cs),
-        "matches": [
-            {
-                "name": m.name,
-                "family": m.family,
-                "side": m.side,
-                "window": m.window,
-                "confidence": m.confidence,
-                "details": m.details,
-            }
-            for m in matches
-        ],
-        "best": (None if not matches else {"name": matches[0].name, "side": matches[0].side, "confidence": matches[0].confidence}),
+        "n": len(raw_candles),
+        "matches": (
+            matches
+            if seq_used
+            else [
+                {
+                    "name": m.name,
+                    "family": m.family,
+                    "side": m.side,
+                    "window": m.window,
+                    "confidence": m.confidence,
+                    "details": m.details,
+                }
+                for m in matches
+            ]
+        ),
+        "best": (
+            None
+            if not matches
+            else (
+                {"name": matches[0]["name"], "side": matches[0]["side"], "confidence": matches[0]["confidence"]}
+                if seq_used
+                else {"name": matches[0].name, "side": matches[0].side, "confidence": matches[0].confidence}
+            )
+        ),
     }
 
 

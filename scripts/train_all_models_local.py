@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -266,30 +265,7 @@ def train_deep_nse_eq_budgeted(
         s_after = (state.get("nse_after") or "").strip()
         effective_after = s_after or None
 
-    # Determine a per-run chunk size.
-    # If max_symbols is set (>0), it caps the chunk size.
-    effective_max_symbols = int(max_symbols)
-    chunk_symbols = 0
-    frac = float(state.get("symbols_fraction_per_run") or 0.0)
-    if "symbols_fraction_per_run" in state:
-        # Allow state file to override defaults if user wants.
-        frac = float(state.get("symbols_fraction_per_run") or 0.0)
-    if frac > 0.0 and frac < 1.0:
-        try:
-            uni = UniverseService()
-            total = int(uni.count(prefix="NSE_EQ|"))
-            if total > 0:
-                chunk_symbols = max(1, int(math.ceil(total * frac)))
-        except Exception:
-            chunk_symbols = 0
-
-    if chunk_symbols > 0:
-        if effective_max_symbols > 0:
-            effective_max_symbols = min(effective_max_symbols, int(chunk_symbols))
-        else:
-            effective_max_symbols = int(chunk_symbols)
-
-    keys = _iter_nse_eq_keys(max_symbols=effective_max_symbols, after=effective_after, page_size=page_size)
+    keys = _iter_nse_eq_keys(max_symbols=max_symbols, after=effective_after, page_size=page_size)
     if not keys:
         print("[deep] No NSE_EQ keys; skipping")
         return
@@ -299,12 +275,7 @@ def train_deep_nse_eq_budgeted(
     total_work = max(1, len(keys) * (int(bool(train_long)) + int(bool(train_intraday))))
     done_work = 0
 
-    _print_progress(
-        "[deep]",
-        start_ts=start_ts,
-        progress=0.0,
-        msg=f"starting budgeted NSE_EQ deep training for {len(keys)} symbols (after={effective_after} max={effective_max_symbols or 'all'})",
-    )
+    _print_progress("[deep]", start_ts=start_ts, progress=0.0, msg=f"starting budgeted NSE_EQ deep training for {len(keys)} symbols (after={effective_after})")
 
     for instrument_key in keys:
         def _map_progress(frac: float, message: str, metrics: dict | None = None) -> None:
@@ -429,7 +400,6 @@ def main(argv: list[str]) -> int:
     p.add_argument("--run-ridge-batch", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--run-deep-nse-eq", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--run-pattern-seq", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--exit-after-deep", action=argparse.BooleanOptionalAction, default=False, help="Exit after deep stage completes (useful for chunked runs).")
 
     p.add_argument(
         "--ridge-universe",
@@ -446,7 +416,6 @@ def main(argv: list[str]) -> int:
     p.add_argument("--deep-checkpoint-dir", default=None, help="Directory to store deep training checkpoints (default: next to DB).")
     p.add_argument("--deep-max-minutes", type=float, default=0.0, help="Stop deep training after this many minutes (0 disables).")
     p.add_argument("--deep-state-file", default=None, help="JSON file to persist NSE cursor between runs.")
-    p.add_argument("--deep-symbol-fraction-per-run", type=float, default=0.0, help="Train only this fraction of NSE_EQ symbols per run (e.g., 0.05 for 5%%).")
     p.add_argument("--deep-train-long", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--deep-train-intraday", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--deep-seq-len", type=int, default=120)
@@ -510,17 +479,6 @@ def main(argv: list[str]) -> int:
 
     if bool(args.run_deep_nse_eq):
         state_file = str(args.deep_state_file) if args.deep_state_file else str(Path(settings.DATABASE_PATH).parent / "checkpoints" / "deep" / "nse_eq_cursor.json")
-
-        # Persist user knobs into state so repeated runs behave consistently.
-        if float(args.deep_symbol_fraction_per_run or 0.0) > 0:
-            _save_json(
-                state_file,
-                {
-                    "symbols_fraction_per_run": float(args.deep_symbol_fraction_per_run),
-                    "updated_ts": int(_utc_now().timestamp()),
-                },
-            )
-
         train_deep_nse_eq_budgeted(
             epochs=int(args.deep_epochs),
             epochs_per_run=int(args.deep_epochs_per_run) if int(args.deep_epochs_per_run) > 0 else None,
@@ -537,9 +495,6 @@ def main(argv: list[str]) -> int:
             train_long=bool(args.deep_train_long),
             train_intraday=bool(args.deep_train_intraday),
         )
-
-        if bool(args.exit_after_deep):
-            return 0
 
     if bool(args.run_pattern_seq):
         train_pattern_seq_nse_eq(

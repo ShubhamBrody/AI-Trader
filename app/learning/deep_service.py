@@ -213,6 +213,7 @@ def train_deep_model(
     lr: float = 2e-4,
     weight_decay: float = 1e-4,
     min_samples: int = 500,
+    data_fraction: float = 1.0,
     require_cuda: bool = False,
     progress_cb: Any | None = None,
     patience: int = 3,
@@ -273,6 +274,16 @@ def train_deep_model(
 
     X_seq = np.asarray(X_seq, dtype=np.float32)
     y_seq = np.asarray(y_seq, dtype=np.float32)
+
+    frac = float(data_fraction)
+    if 0.0 < frac < 1.0 and y_seq.size > 1:
+        target_n = int(round(float(y_seq.size) * frac))
+        target_n = max(2, min(int(y_seq.size), int(target_n)))
+        idx = np.linspace(0, int(y_seq.size) - 1, num=int(target_n), dtype=int)
+        idx = np.unique(idx)
+        if idx.size >= 2:
+            X_seq = X_seq[idx]
+            y_seq = y_seq[idx]
 
     split = int(0.8 * len(y_seq))
     X_tr, y_tr = X_seq[:split], y_seq[:split]

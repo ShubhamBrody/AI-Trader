@@ -11,6 +11,8 @@ class UpstoxBroker(Broker):
     """
 
     def _assert_enabled(self) -> None:
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            raise PermissionError("LIVE_TRADING_ENABLED=false: live orders disabled")
         if settings.SAFE_MODE:
             raise PermissionError("SAFE_MODE=true: live orders disabled")
         if not settings.UPSTOX_ACCESS_TOKEN:

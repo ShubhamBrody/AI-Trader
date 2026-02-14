@@ -26,6 +26,7 @@ function holdingMetrics(h: any) {
   const qty = pickNumber(h, ['quantity', 'qty', 'net_quantity', 'net_qty']) ?? 0;
   const avg = pickNumber(h, ['average_price', 'avg_price', 'buy_avg_price']) ?? 0;
   const ltp = pickNumber(h, ['last_price', 'ltp', 'last_traded_price']) ?? null;
+  const close = pickNumber(h, ['close_price', 'prev_close', 'previous_close', 'close']) ?? null;
   const invested = qty > 0 ? qty * avg : null;
   const value = ltp !== null && qty > 0 ? qty * ltp : null;
 
@@ -35,8 +36,18 @@ function holdingMetrics(h: any) {
 
   // Day P&L: best-effort from common broker fields.
   // If only % is available, we still show it.
-  const dayPnl = pickNumber(h, ['day_pnl', 'pnl_day', 'day_change', 'day_change_value']);
-  const dayPct = pickNumber(h, ['day_change_percentage', 'day_change_pct', 'pnl_day_pct']);
+  let dayPnl = pickNumber(h, ['day_pnl', 'pnl_day', 'day_change', 'day_change_value']);
+  let dayPct = pickNumber(h, ['day_change_percentage', 'day_change_pct', 'pnl_day_pct']);
+
+  // Upstox often returns `day_change=0` even when `close_price` and % change are present.
+  // Derive a more reliable 1D P&L from LTP vs close when possible.
+  if (qty > 0 && ltp !== null && close !== null) {
+    const derivedDayPnl = qty * (ltp - close);
+    if (dayPnl === null || (dayPnl === 0 && derivedDayPnl !== 0)) dayPnl = derivedDayPnl;
+    if (dayPct === null || dayPct === 0) {
+      if (close !== 0) dayPct = ((ltp - close) / close) * 100;
+    }
+  }
 
   return { qty, avg, ltp, invested, value, pnl, retPct, dayPnl, dayPct };
 }

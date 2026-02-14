@@ -12,6 +12,7 @@ type NewsItem = {
   published_at?: string;
   timestamp?: string;
   url?: string | null;
+  summary_text?: string | null;
   sentiment?: number | null;
   impact_score?: number | null;
   impact_label?: 'LOW' | 'MEDIUM' | 'HIGH' | string | null;
@@ -63,6 +64,7 @@ export function NewsPage() {
                   const dt = when ? new Date(when) : null;
                   const timeLabel = dt && !Number.isNaN(dt.getTime()) ? dt.toLocaleString() : '-';
                   const href = n.url ?? undefined;
+                  const summaryText = (n.summary_text ?? '').trim() || null;
 
                   const sentiment = typeof n.sentiment === 'number' ? n.sentiment : null;
                   const impactLabel = n.impact_label ?? null;
@@ -97,6 +99,9 @@ export function NewsPage() {
                           <div className="truncate text-sm font-semibold text-slate-100" title={n.title}>
                             {n.title}
                           </div>
+                          {summaryText ? (
+                            <div className="mt-1 text-sm leading-snug text-slate-200">{summaryText}</div>
+                          ) : null}
                           <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
                             <span>{n.source}</span>
                             {n.region ? (

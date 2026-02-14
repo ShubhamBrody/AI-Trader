@@ -48,6 +48,18 @@ type ChainRow = {
   pe: null | { instrument_key: string; tradingsymbol?: string; ltp?: number | null };
 };
 
+function fmtPct01(v: any): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return `${Math.round(n * 100)}%`;
+}
+
+function fmtNum(v: any, digits = 2): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return n.toFixed(digits);
+}
+
 export function HftIndexOptionsPage() {
   const qc = useQueryClient();
   const [events, setEvents] = useState<HftEvent[]>([]);
@@ -97,6 +109,43 @@ export function HftIndexOptionsPage() {
   const openTrades = statusQ.data?.open_trades;
   const tradesToday = statusQ.data?.trades_today;
   const pnlToday = statusQ.data?.pnl_today;
+
+  const lastDecisions = (statusQ.data?.last_decisions ?? []) as any[];
+  const latestDecision = useMemo(() => {
+    if (!Array.isArray(lastDecisions) || lastDecisions.length === 0) return null;
+    return lastDecisions[lastDecisions.length - 1] ?? null;
+  }, [lastDecisions]);
+  const aiGate = statusQ.data?.ai_gate as
+    | { enabled?: boolean; min_confidence?: number; interval?: string; lookback_days?: number; horizon_steps?: number }
+    | undefined;
+
+  const trendConfluence = statusQ.data?.trend_confluence as
+    | {
+        enabled?: boolean;
+        daily_days?: number;
+        h4_days?: number;
+        h1_days?: number;
+        weights?: Record<string, number>;
+        strategy?: string;
+      }
+    | undefined;
+
+  const [brokerSwitching, setBrokerSwitching] = useState(false);
+  const [brokerSwitchError, setBrokerSwitchError] = useState<string | null>(null);
+
+  async function switchBroker(next: 'paper' | 'upstox') {
+    setBrokerSwitchError(null);
+    setBrokerSwitching(true);
+    try {
+      await apiPost<any>('/api/hft/index-options/broker', { broker: next });
+      qc.invalidateQueries({ queryKey: ['hft-index-options-status'] });
+      qc.invalidateQueries({ queryKey: ['hft-index-options-open-trades'] });
+    } catch (e: any) {
+      setBrokerSwitchError(String(e?.detail ?? e?.message ?? 'Failed to switch broker'));
+    } finally {
+      setBrokerSwitching(false);
+    }
+  }
 
   const chainQ = useQuery({
     queryKey: ['hft-index-options-chain', underlying],
@@ -217,6 +266,34 @@ export function HftIndexOptionsPage() {
               <Badge tone={broker === 'upstox' ? 'warn' : 'neutral'}>Broker: {broker}</Badge>
             </div>
 
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <div className="text-xs text-slate-400">Trading mode</div>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant={broker === 'paper' ? 'primary' : 'secondary'}
+                  disabled={brokerSwitching || running}
+                  onClick={() => switchBroker('paper')}
+                >
+                  Paper
+                </Button>
+                <Button
+                  size="sm"
+                  variant={broker === 'upstox' ? 'primary' : 'secondary'}
+                  disabled={brokerSwitching || running}
+                  onClick={() => switchBroker('upstox')}
+                    title="Requires Upstox login, SAFE_MODE=false, LIVE_TRADING_ENABLED=true"
+                >
+                  Live
+                </Button>
+              </div>
+              {running ? <div className="text-[11px] text-slate-500">Stop loop to switch.</div> : null}
+            </div>
+
+            {brokerSwitchError ? (
+              <div className="mt-2 text-sm text-rose-300">{brokerSwitchError}</div>
+            ) : null}
+
             <div className="mt-4 flex flex-wrap gap-2">
               <Button
                 disabled={!enabled || running}
@@ -260,6 +337,15 @@ export function HftIndexOptionsPage() {
                   { label: 'Open trades', value: openTrades },
                   { label: 'Trades today', value: tradesToday },
                   { label: 'PnL today (INR)', value: pnlToday },
+                  { label: 'AI gate', value: aiGate?.enabled ? 'Enabled' : 'Disabled' },
+                  { label: 'AI min conf', value: aiGate?.min_confidence != null ? Number(aiGate.min_confidence).toFixed(2) : '—' },
+                  { label: 'AI interval', value: aiGate?.interval ?? '—' },
+                  { label: 'AI lookback days', value: aiGate?.lookback_days ?? '—' },
+                  { label: 'AI horizon steps', value: aiGate?.horizon_steps ?? '—' },
+                  { label: 'Trend confluence', value: trendConfluence?.enabled ? 'Enabled' : 'Disabled' },
+                  { label: 'Confluence 1D days', value: trendConfluence?.daily_days ?? '—' },
+                  { label: 'Confluence 4H days', value: trendConfluence?.h4_days ?? '—' },
+                  { label: 'Confluence 1H days', value: trendConfluence?.h1_days ?? '—' },
                   { label: 'Started ts', value: statusQ.data?.started_ts },
                   { label: 'Last cycle ts', value: statusQ.data?.last_cycle_ts },
                 ]}
@@ -267,6 +353,62 @@ export function HftIndexOptionsPage() {
               <div className="mt-2 text-[11px] text-slate-500">
                 “Run once (force)” only affects paper mode and does not enable live trading.
               </div>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-200 bg-white/70 p-3 dark:border-slate-800 dark:bg-slate-950/40">
+              <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Latest AI reasoning</div>
+
+              {latestDecision ? (
+                <div className="mt-2">
+                  <KeyValueGrid
+                    cols={2}
+                    items={[
+                      { label: 'Underlying', value: latestDecision?.underlying ?? '—' },
+                      { label: 'Action', value: latestDecision?.action ?? '—' },
+                      {
+                        label: 'Result',
+                        value: latestDecision?.placed?.ok
+                          ? 'PLACED'
+                          : latestDecision?.ok === false
+                            ? 'REJECTED'
+                            : '—',
+                      },
+                      { label: 'Confidence', value: fmtPct01(latestDecision?.confidence) },
+                      { label: 'Min conf', value: latestDecision?.min_confidence != null ? fmtNum(latestDecision?.min_confidence, 2) : '—' },
+                      { label: 'Reason', value: latestDecision?.reason ?? '—' },
+                      { label: 'Policy', value: latestDecision?.policy?.reason ?? '—' },
+                      { label: 'AI model', value: latestDecision?.ai?.model ?? '—' },
+                      { label: 'AI conf', value: latestDecision?.ai?.confidence != null ? fmtPct01(latestDecision?.ai?.confidence) : '—' },
+                      { label: 'AI unc', value: latestDecision?.ai?.uncertainty != null ? fmtNum(latestDecision?.ai?.uncertainty, 2) : '—' },
+                      {
+                        label: 'Confluence',
+                        value:
+                          latestDecision?.trend_confluence?.dir != null
+                            ? `${String(latestDecision.trend_confluence.dir)} (${fmtPct01(latestDecision.trend_confluence.confidence)})`
+                            : '—',
+                      },
+                      {
+                        label: 'Risk mult',
+                        value:
+                          latestDecision?.trend_confluence_risk_multiplier != null
+                            ? fmtNum(latestDecision?.trend_confluence_risk_multiplier, 2)
+                            : '—',
+                      },
+                      { label: 'Qty', value: latestDecision?.qty ?? '—' },
+                      { label: 'Entry', value: latestDecision?.option_entry != null ? fmtNum(latestDecision?.option_entry, 2) : '—' },
+                      { label: 'Stop', value: latestDecision?.stop != null ? fmtNum(latestDecision?.stop, 2) : '—' },
+                      { label: 'Target', value: latestDecision?.target != null ? fmtNum(latestDecision?.target, 2) : '—' },
+                    ]}
+                  />
+                </div>
+              ) : (
+                <div className="mt-2 text-[11px] text-slate-500">No recent decisions.</div>
+              )}
+
+              <div className="mt-4 text-xs font-semibold text-slate-700 dark:text-slate-200">Last decisions (raw)</div>
+              <pre className="mt-2 overflow-auto text-[11px] text-slate-700 dark:text-slate-300">
+                {JSON.stringify(statusQ.data?.last_decisions ?? [], null, 2)}
+              </pre>
             </div>
 
             <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3">

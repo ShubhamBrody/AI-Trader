@@ -14,6 +14,7 @@ from app.data.continuous import INGESTION
 from app.automation.scheduler import AUTORETRAIN
 from app.utils.logger import configure_logging
 from app.prediction.live import LivePredictorConfig, PREDICTOR
+from app.prediction.retention_loop import RETENTION
 from app.orders.startup_recovery import startup_order_recovery
 from app.reconcile.loop import RECONCILER
 from app.hft.index_options.service import HFT_INDEX_OPTIONS
@@ -57,10 +58,20 @@ def create_app() -> FastAPI:
                 await HFT_INDEX_OPTIONS.start()
             except Exception:
                 pass
+
+        if getattr(settings, "PREDICTION_RETENTION_ENABLED", False):
+            try:
+                await RETENTION.start()
+            except Exception:
+                pass
         yield
         # best-effort shutdown
         try:
             await PREDICTOR.stop()
+        except Exception:
+            pass
+        try:
+            await RETENTION.stop()
         except Exception:
             pass
         try:

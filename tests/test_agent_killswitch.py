@@ -70,6 +70,7 @@ class FakeUpstoxClient:
 def test_agent_cancel_open_orders_upstox_ok(monkeypatch) -> None:
     monkeypatch.setattr(settings_module.settings, "AUTOTRADER_BROKER", "upstox", raising=False)
     monkeypatch.setattr(settings_module.settings, "SAFE_MODE", False, raising=False)
+    monkeypatch.setattr(settings_module.settings, "LIVE_TRADING_ENABLED", True, raising=False)
 
     import app.agent.service as agent_service
 

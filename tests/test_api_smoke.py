@@ -147,6 +147,9 @@ def test_upstox_status_requires_token() -> None:
 
 
 def test_candles_auto_ok() -> None:
+    from app.core.db import init_db
+
+    init_db()
     app = create_app()
     client = TestClient(app)
     r = client.get(

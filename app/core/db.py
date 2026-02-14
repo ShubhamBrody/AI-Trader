@@ -142,6 +142,20 @@ def init_db() -> None:
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS news_llm_summaries (
+                url TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                model TEXT,
+                created_ts INTEGER NOT NULL,
+                title TEXT,
+                source TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_news_llm_summaries_ts ON news_llm_summaries(created_ts)")
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS alert_state (
                 key TEXT PRIMARY KEY,
                 last_ts INTEGER NOT NULL

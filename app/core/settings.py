@@ -22,6 +22,10 @@ class Settings(BaseSettings):
 
     # Trading / safety
     SAFE_MODE: bool = True
+    # Second, explicit guard for real-money order placement.
+    # SAFE_MODE should remain the default local/dev posture; enabling live trading should require
+    # *both* SAFE_MODE=false and LIVE_TRADING_ENABLED=true.
+    LIVE_TRADING_ENABLED: bool = False
     TIMEZONE: str = "Asia/Kolkata"
 
     # Storage
@@ -32,10 +36,26 @@ class Settings(BaseSettings):
     # this short de-dup window avoids redundant upstream calls without changing candle values.
     CANDLES_POLL_DEDUP_MS: int = 250
 
+    # Trend confluence (multi-timeframe, multi-indicator) (OFF by default)
+    # Uses SMA(50/200) + MACD(12,26,9) + RSI(14) + ADX(14) + volume EMA(10)
+    # across 1d/4h/1h to produce a high-confidence trend direction.
+    TRADER_TREND_CONFLUENCE_ENABLED: bool = False
+    # If true, /api/trader/decision will gate BUY/SELL when confluence is "range" or conflicts.
+    TRADER_TREND_CONFLUENCE_GATE_ENABLED: bool = False
+    # Lookback windows for each timeframe.
+    TRADER_TREND_CONFLUENCE_DAILY_DAYS: int = 420
+    TRADER_TREND_CONFLUENCE_H4_DAYS: int = 90
+    TRADER_TREND_CONFLUENCE_H1_DAYS: int = 30
+
     # Optional sequence-based candlestick pattern model (OFF by default)
     PATTERN_SEQ_MODEL_ENABLED: bool = False
     PATTERN_SEQ_MODEL_PATH: str = "data/models/pattern_seq.pt"
     PATTERN_SEQ_MODEL_SEQ_LEN: int = 64
+
+    # Model selection variant
+    # When set (e.g. "_lightweight"), the AI engine will append this suffix to the computed
+    # model_family (e.g. long -> long_lightweight) for both ridge and deep model lookups.
+    MODEL_FAMILY_SUFFIX: str = ""
 
     # CORS
     CORS_ALLOW_ORIGINS: list[str] = ["*"]
@@ -72,6 +92,16 @@ class Settings(BaseSettings):
     # News (RSS) + sentiment
     NEWS_RSS_URLS: str = "https://www.moneycontrol.com/rss/business.xml,https://economictimes.indiatimes.com/rssfeedsdefault.cms"
 
+    # News (LLM summaries via Ollama) (OFF by default)
+    # When enabled, the backend will attempt to fetch the article HTML for each news URL,
+    # extract text, and generate a short summary using a local Ollama server.
+    NEWS_LLM_SUMMARY_ENABLED: bool = False
+    # Cache duration for generated summaries.
+    NEWS_LLM_SUMMARY_TTL_DAYS: int = 7
+    # Ollama connection + model
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2:latest"
+
     # Recommendation universe (fallback if watchlist is empty)
     DEFAULT_UNIVERSE: str = "NSE_EQ|INE002A01018,NSE_EQ|INE009A01021,NSE_EQ|INE467B01029,NSE_EQ|INE040A01034"
 
@@ -104,6 +134,10 @@ class Settings(BaseSettings):
     # Autotrader exits
     AUTOTRADER_TARGET_EXIT_ENABLED: bool = True
     AUTOTRADER_TRAILING_ENABLED: bool = True
+
+    # If enabled, the agent will compute stop/target from the intraday AI prediction
+    # (projected high/low + confidence/uncertainty) instead of using only rule-based levels.
+    AUTOTRADER_AI_RISK_PLAN_ENABLED: bool = False
     # Activate trailing once price has moved this many R in favor (R = initial risk per share).
     AUTOTRADER_TRAIL_ACTIVATION_R: float = 1.0
     # Trailing distance as fraction of price. Example 0.005 => 0.5%
@@ -119,6 +153,9 @@ class Settings(BaseSettings):
     # Only apply stop/target updates if the change is meaningful.
     AUTOTRADER_OVERLAYS_MIN_STOP_MOVE_PCT: float = 0.001
     AUTOTRADER_OVERLAYS_MIN_TARGET_MOVE_PCT: float = 0.002
+
+    # Optional: multi-timeframe confluence gate + risk scaling (OFF by default)
+    AUTOTRADER_TREND_CONFLUENCE_ENABLED: bool = False
 
     # Index Options HFT (OFF by default)
     # Trades long CALL/PUT options on NIFTY and SENSEX using 1m/5m signals.
@@ -162,6 +199,17 @@ class Settings(BaseSettings):
     INDEX_OPTIONS_HFT_OPTION_STOP_PCT: float = 0.12
     INDEX_OPTIONS_HFT_OPTION_TARGET_PCT: float = 0.18
     INDEX_OPTIONS_HFT_MAX_HOLD_MINUTES: int = 30
+
+    # AI gate (optional): require AIEngine BUY/SELL approval before entering.
+    # Note: Even without trained models, AIEngine falls back to a statistical stub.
+    INDEX_OPTIONS_HFT_AI_GATE_ENABLED: bool = False
+    INDEX_OPTIONS_HFT_AI_MIN_CONFIDENCE: float = 0.60
+    INDEX_OPTIONS_HFT_AI_INTERVAL: str = "1m"
+    INDEX_OPTIONS_HFT_AI_LOOKBACK_DAYS: int = 7
+    INDEX_OPTIONS_HFT_AI_HORIZON_STEPS: int = 12
+
+    # Optional: multi-timeframe confluence gate + risk scaling (OFF by default)
+    INDEX_OPTIONS_HFT_TREND_CONFLUENCE_ENABLED: bool = False
 
     # Adaptive learning persistence
     INDEX_OPTIONS_HFT_STATE_PATH: str = "data/hft_index_options_state.json"
@@ -210,6 +258,16 @@ class Settings(BaseSettings):
     PREDICTOR_LOOKBACK_MINUTES: int = 240
     PREDICTOR_POLL_SECONDS: int = 10
     PREDICTOR_CALIBRATION_ALPHA: float = 0.05
+
+    # Prediction retention/cleanup (OFF by default)
+    # When enabled, old rows in prediction_events are deleted to keep DB size bounded.
+    PREDICTION_RETENTION_ENABLED: bool = False
+    # If > 0: delete rows where ts_pred < now - max_age_days.
+    PREDICTION_RETENTION_MAX_AGE_DAYS: int = 0
+    # If > 0: keep only the newest max_rows rows.
+    PREDICTION_RETENTION_MAX_ROWS: int = 0
+    # How often to run retention in the background.
+    PREDICTION_RETENTION_POLL_SECONDS: int = 60 * 60  # 1 hour
 
     # Upstox (optional)
     UPSTOX_CLIENT_ID: str | None = None

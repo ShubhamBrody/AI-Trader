@@ -42,12 +42,16 @@ Open:
 - Candles:
 	- `POST /api/candles/historical/load`
 	- `POST /api/intraday/poll`
+- Trade:
+	- Strategy execute (paper or Upstox): `POST /api/trade/execute` (params: `instrument_key`, `interval`, `account_balance`, `lot_size`, `broker`)
 - AI:
 	- `GET /api/ai/predict` (supports `interval`, `lookback_days`, `horizon_steps`)
 - Orders:
 	- Paper: `POST /api/orders/place` with `broker="paper"`
 	- Upstox (read): `GET /api/orders/upstox/book`, `GET /api/orders/upstox/details`, `GET /api/orders/upstox/positions`, `GET /api/orders/upstox/holdings`
-	- Upstox (write, requires `SAFE_MODE=false` and market LIVE): `POST /api/orders/upstox/place-v3`, `PUT /api/orders/upstox/modify-v3`, `DELETE /api/orders/upstox/cancel-v3`
+	- Upstox (write, requires `SAFE_MODE=false`, `LIVE_TRADING_ENABLED=true`, and market LIVE):
+		- Simple: `POST /api/orders/place` with `broker="upstox"` + `instrument_key` + `side` + `qty`
+		- Advanced (pass-through): `POST /api/orders/upstox/place-v3`, `PUT /api/orders/upstox/modify-v3`, `DELETE /api/orders/upstox/cancel-v3`
 - Learning:
 	- `POST /api/learning/train` (trains + persists model in SQLite)
 	- `GET /api/learning/status`
@@ -63,7 +67,7 @@ Open:
 
 ## Notes
 - Candles use Upstox V3 when `UPSTOX_ACCESS_TOKEN` is set; otherwise it falls back to deterministic synthetic candles.
-- Live trading is blocked by default via `SAFE_MODE=true`.
+- Live trading is blocked by default via `SAFE_MODE=true` and `LIVE_TRADING_ENABLED=false`.
 - SQLite DB defaults to `./data/app.db`.
 
 ## Deep Learning (Optional)

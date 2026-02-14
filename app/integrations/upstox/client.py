@@ -165,6 +165,8 @@ class UpstoxClient:
 
     def place_order_v2(self, body: dict[str, Any]) -> dict[str, Any]:
         # Guarded outside by SAFE_MODE in broker, but keep extra hard stop here.
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            raise UpstoxError("LIVE_TRADING_ENABLED=false: refusing to place live orders")
         if settings.SAFE_MODE:
             raise UpstoxError("SAFE_MODE=true: refusing to place live orders")
 
@@ -173,6 +175,8 @@ class UpstoxClient:
         return self._post(url, body)
 
     def place_order_v3(self, body: dict[str, Any]) -> dict[str, Any]:
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            raise UpstoxError("LIVE_TRADING_ENABLED=false: refusing to place live orders")
         if settings.SAFE_MODE:
             raise UpstoxError("SAFE_MODE=true: refusing to place live orders")
         base = self.cfg.hft_base_url.rstrip("/")
@@ -180,6 +184,8 @@ class UpstoxClient:
         return self._post(url, body)
 
     def modify_order_v3(self, body: dict[str, Any]) -> dict[str, Any]:
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            raise UpstoxError("LIVE_TRADING_ENABLED=false: refusing to modify live orders")
         if settings.SAFE_MODE:
             raise UpstoxError("SAFE_MODE=true: refusing to modify live orders")
         base = self.cfg.hft_base_url.rstrip("/")
@@ -187,6 +193,8 @@ class UpstoxClient:
         return self._put(url, body)
 
     def cancel_order_v3(self, order_id: str) -> dict[str, Any]:
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            raise UpstoxError("LIVE_TRADING_ENABLED=false: refusing to cancel live orders")
         if settings.SAFE_MODE:
             raise UpstoxError("SAFE_MODE=true: refusing to cancel live orders")
         base = self.cfg.hft_base_url.rstrip("/")
@@ -237,6 +245,24 @@ class UpstoxClient:
         if isinstance(data, dict) and data.get("status") not in (None, "success"):
             raise UpstoxError(f"Upstox response status not success: {data}")
         return data
+
+    def market_quote_quotes_v2(self, instrument_keys: list[str]) -> dict[str, Any]:
+        """Fetch full market quote snapshot for up to ~500 instruments.
+
+        Upstox endpoint: GET /v2/market-quote/quotes?instrument_key=KEY1,KEY2
+        Returns a dict payload with "data" mapping where each value includes
+        fields like "instrument_token" and "last_price".
+        """
+
+        keys = [str(k).strip() for k in (instrument_keys or []) if str(k).strip()]
+        if not keys:
+            return {"status": "success", "data": {}}
+        if len(keys) > 500:
+            raise UpstoxError("Upstox market quote supports up to 500 instruments per request")
+
+        base = self.cfg.base_url.rstrip("/")
+        url = base + "/v2/market-quote/quotes"
+        return self._request_with_resilience("GET", url, params={"instrument_key": ",".join(keys)})
 
 
 def parse_upstox_candles(candles: list[list[Any]]) -> list[dict[str, Any]]:

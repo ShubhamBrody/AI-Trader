@@ -36,8 +36,9 @@ def trade_state(
     highs = [c.high for c in series.candles]
     lows = [c.low for c in series.candles]
     closes = [c.close for c in series.candles]
+    volumes = [getattr(c, "volume", 0.0) for c in series.candles]
 
-    idea = _strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes)
+    idea = _strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes, volumes=volumes)
     pred = _ai.predict(instrument_key=instrument_key, include_nifty=False)
 
     conf = float(pred.get("prediction", {}).get("confidence", 0.0))

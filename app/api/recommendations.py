@@ -8,6 +8,9 @@ from threading import Lock
 from fastapi import APIRouter, Query
 from fastapi import BackgroundTasks, HTTPException
 
+from app.ai.candlestick_patterns import detect_patterns, to_candles
+from app.ai.engine import AIEngine
+from app.ai.pattern_memory import ensure_all_catalog_rows, get_weights_cached
 from app.ai.recommendation_engine import RecommendationEngine
 from app.ai.recommendations_cache_files import (
     backup_path,
@@ -22,6 +25,8 @@ from app.realtime.bus import publish_sync
 
 router = APIRouter(prefix="/recommendations")
 engine = RecommendationEngine()
+
+_ai = AIEngine()
 
 
 _jobs_lock = Lock()
@@ -148,7 +153,7 @@ def top(
                 "confidence": r.get("confidence"),
                 "predicted_action": r.get("signal"),
                 "predicted_return_pct": (expected_return * 100.0) if ik else None,
-                "predicted_close": None,
+                "predicted_close": r.get("predicted_close"),
                 "risk_score": r.get("uncertainty"),
                 "risk_reward_ratio": None,
                 "trend_strength": None,
@@ -363,3 +368,245 @@ def refresh_current() -> dict:
     if not job:
         return {"ok": False, "refreshing": False}
     return {"ok": True, "refreshing": True, **job}
+
+
+def _clamp01(x: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if v != v:  # NaN
+        return 0.0
+    return float(max(0.0, min(1.0, v)))
+
+
+def _pattern_stats(names: list[str]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    uniq = [str(n).strip() for n in (names or []) if str(n).strip()]
+    if not uniq:
+        return out
+    # Ensure the catalog is present in DB; safe to call repeatedly.
+    try:
+        ensure_all_catalog_rows()
+    except Exception:
+        pass
+
+    # SQLite parameter limit is typically 999; keep this small.
+    uniq = uniq[:200]
+    qs = ",".join(["?"] * len(uniq))
+    with db_conn() as conn:
+        rows = conn.execute(
+            f"SELECT pattern, weight, seen, wins, losses, ema_winrate FROM candle_pattern_stats WHERE pattern IN ({qs})",
+            tuple(uniq),
+        ).fetchall()
+    for r in rows:
+        name = str(r["pattern"])
+        out[name] = {
+            "weight": float(r["weight"] or 1.0),
+            "seen": int(r["seen"] or 0),
+            "wins": int(r["wins"] or 0),
+            "losses": int(r["losses"] or 0),
+            "ema_winrate": float(r["ema_winrate"] or 0.5),
+        }
+    return out
+
+
+def _statistical_recommendation_for(
+    *,
+    instrument_key: str,
+    interval: str,
+    lookback_days: int,
+    horizon_steps: int,
+    max_patterns: int,
+) -> dict:
+    ik = str(instrument_key or "").strip()
+    if not ik:
+        return {"ok": False, "detail": "instrument_key is required"}
+
+    interval_s = str(interval or "1m")
+    lookback_days_i = max(1, min(int(lookback_days), 365))
+    horizon_i = max(1, min(int(horizon_steps), 500))
+    # Kept for backward-compatible API params; patterns are no longer fused here.
+    max_patterns_i = max(0, min(int(max_patterns), 8))
+
+    # 1) Model prediction (direction + uncertainty)
+    pred_out = _ai.predict(
+        instrument_key=ik,
+        interval=interval_s,
+        lookback_days=lookback_days_i,
+        horizon_steps=horizon_i,
+        include_nifty=False,
+        model_family=("intraday" if interval_s.endswith("m") else "long"),
+    )
+
+    pred = (pred_out.get("prediction") or {}) if isinstance(pred_out, dict) else {}
+    feats = (pred_out.get("features") or {}) if isinstance(pred_out, dict) else {}
+    meta = (pred_out.get("meta") or {}) if isinstance(pred_out, dict) else {}
+    model_name = str(meta.get("model") or "")
+
+    model_signal = str(pred.get("signal") or "HOLD").upper()
+    model_conf = _clamp01(float(pred.get("confidence") or 0.0))
+    model_unc = _clamp01(float(pred.get("uncertainty") or 1.0))
+
+    last_close = float(feats.get("last_close") or 0.0)
+    next_close = float(((pred.get("next_hour_ohlc") or {}) if isinstance(pred.get("next_hour_ohlc"), dict) else {}).get("close") or 0.0)
+    expected_return = 0.0
+    if last_close > 0 and next_close > 0:
+        expected_return = float((next_close - last_close) / last_close)
+
+    # AI-only recommendation: use the model's own direction and confidence.
+    signal = model_signal if model_signal in {"BUY", "SELL", "HOLD"} else "HOLD"
+    confidence = float(model_conf)
+
+    # Signed score aligns with direction but remains comparable across instruments.
+    signed_return = float(expected_return)
+    if signal == "SELL":
+        signed_return = -abs(float(expected_return))
+    if signal == "HOLD":
+        signed_return = 0.0
+
+    reasons: list[str] = []
+    mf = str(meta.get("model_family") or "")
+    reasons.append(f"ai:{model_name or 'model'} family={mf or '-'} {signal} conf={model_conf:.2f} unc={model_unc:.2f}")
+    if max_patterns_i:
+        reasons.append("patterns:disabled")
+
+    return {
+        "ok": True,
+        "instrument_key": ik,
+        "interval": interval_s,
+        "horizon_steps": int(horizon_i),
+        "signal": signal,
+        "confidence": float(confidence),
+        "uncertainty": float(model_unc),
+        "p_buy": None,
+        "expected_return": float(signed_return),
+        "expected_return_raw": float(expected_return),
+        "reasons": reasons,
+    }
+
+
+@router.get("/statistical")
+def statistical(
+    instrument_key: str,
+    interval: str = Query("5m"),
+    lookback_days: int = Query(30, ge=1, le=365),
+    horizon_steps: int = Query(12, ge=1, le=500),
+    max_patterns: int = Query(3, ge=0, le=8),
+) -> dict:
+    """Generate an AI-only BUY/SELL/HOLD recommendation (no order placement).
+
+    Uses AIEngine.predict() direction/confidence/uncertainty.
+    (Historical pattern fusion is disabled to keep recommendations AI-driven.)
+    """
+
+    return _statistical_recommendation_for(
+        instrument_key=instrument_key,
+        interval=interval,
+        lookback_days=int(lookback_days),
+        horizon_steps=int(horizon_steps),
+        max_patterns=int(max_patterns),
+    )
+
+
+@router.get("/statistical/top")
+def statistical_top(
+    n: int = Query(10, ge=1, le=50),
+    min_confidence: float = Query(0.6, ge=0.0, le=1.0),
+    max_risk: float = Query(0.7, ge=0.0, le=1.0),
+    universe_limit: int = Query(50, ge=10, le=500),
+    interval: str = Query("5m"),
+    lookback_days: int = Query(30, ge=1, le=365),
+    horizon_steps: int = Query(12, ge=1, le=500),
+    max_patterns: int = Query(3, ge=0, le=8),
+) -> dict:
+    """Scan a small universe and return top statistical recommendations.
+
+    Notes:
+    - Conservative default universe_limit=50 to keep latency reasonable.
+    - Does not place orders.
+    """
+
+    keys = []
+    try:
+        # Reuse the same stable universe selection as the main recommendation engine.
+        keys = list(engine._universe_keys(limit=int(universe_limit)))  # type: ignore[attr-defined]
+    except Exception:
+        keys = []
+
+    out: list[dict] = []
+    analyzed = 0
+    failed = 0
+
+    for k in keys:
+        analyzed += 1
+        try:
+            rec = _statistical_recommendation_for(
+                instrument_key=str(k),
+                interval=str(interval),
+                lookback_days=int(lookback_days),
+                horizon_steps=int(horizon_steps),
+                max_patterns=int(max_patterns),
+            )
+            if not rec.get("ok"):
+                failed += 1
+                continue
+            conf = float(rec.get("confidence") or 0.0)
+            risk = float(rec.get("uncertainty") or 1.0)
+            if conf < float(min_confidence):
+                continue
+            if risk > float(max_risk):
+                continue
+            out.append(rec)
+        except Exception:
+            failed += 1
+
+    # Sort by absolute expected return weighted by confidence.
+    out.sort(key=lambda r: abs(float(r.get("expected_return") or 0.0)) * float(r.get("confidence") or 0.0), reverse=True)
+    out = out[: int(n)]
+
+    # Map into the same frontend-friendly shape as /top.
+    now = datetime.now(timezone.utc).isoformat()
+    recs_ui: list[dict] = []
+    for r in out:
+        ik = str(r.get("instrument_key") or "")
+        expected_return = float(r.get("expected_return") or 0.0)
+        symbol = None
+        try:
+            with db_conn() as conn:
+                row = conn.execute(
+                    "SELECT tradingsymbol FROM instrument_meta WHERE instrument_key=? LIMIT 1",
+                    (ik,),
+                ).fetchone()
+            if row and row["tradingsymbol"]:
+                symbol = str(row["tradingsymbol"])
+        except Exception:
+            symbol = None
+
+        recs_ui.append(
+            {
+                "instrument_key": ik,
+                "symbol": symbol,
+                "score": float(expected_return * 100.0),
+                "confidence": float(r.get("confidence") or 0.0),
+                "predicted_action": str(r.get("signal") or "HOLD"),
+                "predicted_return_pct": float(expected_return * 100.0),
+                "risk_score": float(r.get("uncertainty") or 1.0),
+                "reasons": list(r.get("reasons") or []),
+                "timestamp": now,
+            }
+        )
+
+    return {
+        "recommendations": recs_ui,
+        "count": len(recs_ui),
+        "meta": {
+            "mode": "statistical",
+            "interval": str(interval),
+            "lookback_days": int(lookback_days),
+            "horizon_steps": int(horizon_steps),
+            "universe_limit": int(universe_limit),
+            "analyzed": int(analyzed),
+            "failed": int(failed),
+        },
+    }

@@ -398,7 +398,8 @@ class RecommendationEngine:
         progress_cb: Callable[[int, int, str, str], None] | None,
     ) -> dict:
         scored = []
-        market_sent = float(self._news.market_sentiment().get("sentiment", 0.0))
+        # AI-only recommendations: do not blend in separate sentiment heuristics here.
+        market_sent = 0.0
 
         keys = self._universe_keys(limit=n)
         total = len(keys)
@@ -448,9 +449,7 @@ class RecommendationEngine:
                 continue
 
             expected_ret = (next_close - last_close) / last_close
-            # Blend in news sentiment as a small prior; do not let it dominate.
-            news_bonus = float(max(-0.02, min(0.02, market_sent * 0.02)))
-            score = (expected_ret + news_bonus) * conf * (1.0 - unc)
+            score = expected_ret * conf * (1.0 - unc)
 
             scored.append(
                 {
@@ -461,7 +460,9 @@ class RecommendationEngine:
                     "model_confidence": float(model_conf),
                     "uncertainty": unc,
                     "expected_return": float(expected_ret),
-                    "market_sentiment": market_sent,
+                    "market_sentiment": float(market_sent),
+                    "last_close": float(last_close),
+                    "predicted_close": float(next_close),
                     "confidence_breakdown": {
                         "model": model_name,
                         "model_confidence": float(model_conf),
@@ -473,7 +474,6 @@ class RecommendationEngine:
                         f"Signal={sig}",
                         f"Confidence={conf:.2f} (model={model_name})",
                         f"Uncertainty={unc:.2f}",
-                        f"MarketSentiment={market_sent:.2f}",
                     ],
                 }
             )

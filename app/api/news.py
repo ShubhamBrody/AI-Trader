@@ -35,7 +35,8 @@ def recent(limit: int = 50, days: int = 7) -> dict:
     min_ts = None
     if d > 0:
         min_ts = int((datetime.now(timezone.utc) - timedelta(days=d)).timestamp())
-    items = svc.recent(limit=int(limit), min_ts=min_ts)
+    raw_items = svc.recent(limit=int(limit), min_ts=min_ts)
+    items = [svc.enrich_item_for_ui(it) for it in raw_items]
     # BackendComplete contract key
     return {"news": items, "items": items}
 
@@ -90,3 +91,14 @@ def news_for_symbol(
 @router.post("/mentions/rebuild")
 def rebuild_mentions(limit_news: int = Query(300, ge=1, le=2000)) -> dict:
     return svc.rebuild_mentions(limit_news=int(limit_news))
+
+
+@router.post("/rescore")
+def rescore_news(
+    limit_news: int = Query(300, ge=1, le=5000),
+    interval: str = Query("1d", min_length=1),
+) -> dict:
+    """Recompute sentiment/impact for existing news items using AI-first scoring."""
+    res = svc.rescore_recent(limit_news=int(limit_news), interval=interval)
+    log_event("news.rescore", res)
+    return res

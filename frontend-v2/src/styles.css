@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+/*
+  Theme toggle animation:
+  We only enable transitions while `html` has the `theme-transition` class
+  (added briefly in `src/theme.ts`), so initial page load doesn't animate.
+*/
+html.theme-transition,
+html.theme-transition * {
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    border-color 180ms ease,
+    fill 180ms ease,
+    stroke 180ms ease;
+}
+
+@layer base {
+  body {
+    @apply bg-slate-100 text-slate-900;
+  }
+
+  html.dark body {
+    @apply bg-slate-950 text-slate-100;
+  }
+}
+
+* {
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+a {
+  color: inherit;
+}

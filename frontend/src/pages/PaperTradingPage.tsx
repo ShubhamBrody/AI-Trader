@@ -21,10 +21,13 @@ export function PaperTradingPage() {
   const instrument = useAppSelector((s) => s.selection.instrument);
 
   const [interval, setInterval] = useState<Interval>('1m');
+  const [execBroker, setExecBroker] = useState<'paper' | 'upstox'>('paper');
   const [accountBalance, setAccountBalance] = useState(100000);
   const [lotSize, setLotSize] = useState(1);
   const [depositAmount, setDepositAmount] = useState(10000);
   const [withdrawAmount, setWithdrawAmount] = useState(1000);
+  const [liveSide, setLiveSide] = useState<'BUY' | 'SELL'>('BUY');
+  const [liveQty, setLiveQty] = useState(1);
 
   const instrumentQuery = instrument.instrument_key ?? instrument.input;
   const inst = useInstrumentResolve(instrumentQuery);
@@ -39,6 +42,12 @@ export function PaperTradingPage() {
   const positions = useQuery({
     queryKey: ['paper-positions'],
     queryFn: () => apiGet<any>('/api/paper/positions'),
+    retry: 0,
+  });
+
+  const brokersQ = useQuery({
+    queryKey: ['order-brokers'],
+    queryFn: () => apiGet<any>('/api/orders/brokers'),
     retry: 0,
   });
 
@@ -59,14 +68,24 @@ export function PaperTradingPage() {
   const execute = useMutation({
     mutationFn: () =>
       apiPost<any>(
-        `/api/paper/execute?instrument_key=${encodeURIComponent(resolvedKey ?? instrumentQuery)}&interval=${encodeURIComponent(
+        `/api/trade/execute?instrument_key=${encodeURIComponent(resolvedKey ?? instrumentQuery)}&interval=${encodeURIComponent(
           interval
-        )}&account_balance=${accountBalance}&lot_size=${lotSize}`
+        )}&account_balance=${accountBalance}&lot_size=${lotSize}&broker=${encodeURIComponent(execBroker)}`
       ),
     onSuccess: () => {
       account.refetch();
       positions.refetch();
     },
+  });
+
+  const placeLive = useMutation({
+    mutationFn: () =>
+      apiPost<any>('/api/orders/place', {
+        broker: 'upstox',
+        instrument_key: resolvedKey ?? instrumentQuery,
+        side: liveSide,
+        qty: liveQty,
+      }),
   });
 
   const tone = useMemo(() => {
@@ -119,6 +138,13 @@ export function PaperTradingPage() {
                 </Select>
               </div>
               <div>
+                <div className="mb-1 text-xs text-slate-400">Broker</div>
+                <Select value={execBroker} onChange={(e) => setExecBroker(e.target.value as 'paper' | 'upstox')}>
+                  <option value="paper">Paper</option>
+                  <option value="upstox">Live (Upstox)</option>
+                </Select>
+              </div>
+              <div>
                 <div className="mb-1 text-xs text-slate-400">Account Balance</div>
                 <Input type="number" value={accountBalance} onChange={(e) => setAccountBalance(Number(e.target.value))} />
               </div>
@@ -146,7 +172,7 @@ export function PaperTradingPage() {
 
             <div className="flex items-center gap-3">
               <Button onClick={() => execute.mutate()} disabled={execute.isPending}>
-                {execute.isPending ? 'Executing…' : 'Execute Paper Trade'}
+                {execute.isPending ? 'Executing…' : 'Execute Trade'}
               </Button>
               {execute.data?.status ? <Badge tone={tone as any}>{execute.data.status}</Badge> : null}
             </div>
@@ -195,6 +221,50 @@ export function PaperTradingPage() {
               <KeyValueGrid items={[{ label: 'Cash Balance', value: account.data?.cash_balance }]} cols={1} />
               <Details title="Raw" data={account.data ?? account.error} />
             </div>
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Live Order (Upstox)</CardTitle>
+          </CardHeader>
+          <CardBody className="space-y-4">
+            <div className="text-xs text-slate-400">
+              Requires Upstox login, <span className="text-slate-300">SAFE_MODE=false</span>, and{' '}
+              <span className="text-slate-300">LIVE_TRADING_ENABLED=true</span>.
+            </div>
+
+            <KeyValueGrid
+              items={[
+                { label: 'SAFE_MODE', value: String(brokersQ.data?.safe_mode) },
+                { label: 'LIVE_TRADING_ENABLED', value: String(brokersQ.data?.live_trading_enabled) },
+                { label: 'UPSTOX_CONFIGURED', value: String(brokersQ.data?.upstox_configured) },
+              ]}
+              cols={1}
+            />
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div>
+                <div className="mb-1 text-xs text-slate-400">Side</div>
+                <Select value={liveSide} onChange={(e) => setLiveSide(e.target.value as 'BUY' | 'SELL')}>
+                  <option value="BUY">BUY</option>
+                  <option value="SELL">SELL</option>
+                </Select>
+              </div>
+              <div>
+                <div className="mb-1 text-xs text-slate-400">Quantity</div>
+                <Input type="number" value={liveQty} onChange={(e) => setLiveQty(Number(e.target.value))} />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <Button onClick={() => placeLive.mutate()} disabled={placeLive.isPending}>
+                {placeLive.isPending ? 'Placing…' : 'Place Market Order'}
+              </Button>
+              {placeLive.data?.status ? <Badge tone="neutral">{String(placeLive.data.status)}</Badge> : null}
+            </div>
+
+            <Details title="Result" data={placeLive.data ?? (placeLive.error as any)} />
           </CardBody>
         </Card>
       </div>

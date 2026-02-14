@@ -179,6 +179,7 @@ def train_model(
     cap_tier: str | None = None,
     l2: float = 1e-2,
     min_samples: int = 200,
+    data_fraction: float = 1.0,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     end = now
@@ -287,6 +288,17 @@ def train_model(
     X = np.asarray(X_rows, dtype=float)
     y = np.asarray(y_rows, dtype=float)
 
+    frac = float(data_fraction)
+    if 0.0 < frac < 1.0 and y.size > 1:
+        target_n = int(round(float(y.size) * frac))
+        target_n = max(2, min(int(y.size), int(target_n)))
+        idx = np.linspace(0, int(y.size) - 1, num=int(target_n), dtype=int)
+        # Ensure strictly increasing indices to avoid duplicates for small series.
+        idx = np.unique(idx)
+        if idx.size >= 2:
+            X = X[idx]
+            y = y[idx]
+
     # Simple time-based split (80/20) to avoid leakage.
     split = int(0.8 * len(y))
     X_tr, y_tr = X[:split], y[:split]
@@ -303,7 +315,7 @@ def train_model(
         interval=interval,
         horizon_steps=int(horizon_steps),
         trained_ts=trained_ts,
-        n_samples=int(len(y_rows)),
+        n_samples=int(y.size),
         feature_names=feature_names,
         weights=[float(v) for v in w.tolist()],
         bias=float(bias),

@@ -12,6 +12,8 @@ from app.core.audit import log_event
 from app.integrations.upstox.client import UpstoxClient, UpstoxConfig, UpstoxError
 from app.orders.state import create_order
 from app.paper_trading.service import PaperTradingService
+from app.core.db import db_conn
+from app.integrations.upstox.order_builder import build_equity_intraday_market_order
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -32,13 +34,31 @@ class OrderPlaceRequest(BaseModel):
     price: float | None = Field(default=None, gt=0)
 
     # Upstox broker fields
+    # If you don't want to pass raw `upstox_body`, you can supply instrument_key+side+qty and the
+    # backend will build a basic intraday MARKET order using instrument_meta.upstox_token.
+    instrument_key: str | None = None
     upstox_body: dict[str, Any] | None = None
+
+
+def _resolve_upstox_token(*, instrument_key: str) -> str | None:
+    key = str(instrument_key or "").strip()
+    if not key:
+        return None
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT upstox_token FROM instrument_meta WHERE instrument_key=? LIMIT 1",
+            (key,),
+        ).fetchone()
+        token = None if row is None else row["upstox_token"]
+        token_s = (str(token).strip() if token is not None else "")
+        return token_s or None
 
 
 @router.get("/brokers")
 def brokers() -> dict:
     return {
         "safe_mode": settings.SAFE_MODE,
+        "live_trading_enabled": bool(getattr(settings, "LIVE_TRADING_ENABLED", False)),
         "supported": ["paper", "upstox"],
         "upstox_configured": bool(settings.UPSTOX_ACCESS_TOKEN),
     }
@@ -84,6 +104,8 @@ def place(req: OrderPlaceRequest, request: Request) -> dict:
         return {**res, "order_state_id": order_state_id}
 
     # Upstox (live)
+    if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+        raise HTTPException(status_code=403, detail="LIVE_TRADING_ENABLED=false: live orders disabled")
     if settings.SAFE_MODE:
         raise HTTPException(status_code=403, detail="SAFE_MODE=true: live orders disabled")
 
@@ -95,10 +117,30 @@ def place(req: OrderPlaceRequest, request: Request) -> dict:
 
     if not settings.UPSTOX_ACCESS_TOKEN:
         raise HTTPException(status_code=400, detail="UPSTOX_ACCESS_TOKEN is not configured")
-    if not req.upstox_body:
-        raise HTTPException(
-            status_code=400,
-            detail="upstox orders require upstox_body (pass-through payload for /v2/order/place)",
+    # Build a basic Upstox order if caller didn't provide a raw pass-through payload.
+    upstox_body = req.upstox_body
+    if not upstox_body:
+        key = str(req.instrument_key or req.symbol or "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="upstox orders require instrument_key (or upstox_body)")
+        if not (req.side and req.qty):
+            raise HTTPException(status_code=400, detail="upstox orders require side and qty (or upstox_body)")
+
+        token = _resolve_upstox_token(instrument_key=key)
+        if not token:
+            raise HTTPException(
+                status_code=400,
+                detail="instrument_key not mapped to upstox_token. Import exchange instruments via /api/universe/import-upstox-exchange",
+            )
+
+        tag = (str(req.client_order_id).strip() if req.client_order_id else "manual")
+        if len(tag) > 24:
+            tag = tag[:24]
+        upstox_body = build_equity_intraday_market_order(
+            instrument_token=str(token),
+            side=str(req.side),
+            qty=int(float(req.qty)),
+            tag=str(tag),
         )
 
     client_order_id = (str(req.client_order_id).strip() if req.client_order_id else None)
@@ -112,20 +154,20 @@ def place(req: OrderPlaceRequest, request: Request) -> dict:
     # Persist intent BEFORE calling the broker (crash-safe).
     order_state_id = create_order(
         broker="upstox",
-        instrument_key=str((req.upstox_body or {}).get("instrument_token") or ""),
-        side=str((req.upstox_body or {}).get("transaction_type") or (req.upstox_body or {}).get("side") or "").upper() or "BUY",
-        qty=float((req.upstox_body or {}).get("quantity") or 1),
+        instrument_key=str((upstox_body or {}).get("instrument_token") or ""),
+        side=str((upstox_body or {}).get("transaction_type") or (upstox_body or {}).get("side") or "").upper() or "BUY",
+        qty=float((upstox_body or {}).get("quantity") or 1),
         order_kind="MANUAL",
-        order_type=str((req.upstox_body or {}).get("order_type") or "UPSTOX"),
+        order_type=str((upstox_body or {}).get("order_type") or "UPSTOX"),
         client_order_id=client_order_id,
         status="NEW",
-        meta={"body": req.upstox_body, "tag": (req.upstox_body or {}).get("tag"), "request": req.model_dump()},
+        meta={"body": upstox_body, "tag": (upstox_body or {}).get("tag"), "request": req.model_dump()},
     )
 
     cfg = UpstoxConfig(base_url=settings.UPSTOX_BASE_URL, hft_base_url=settings.UPSTOX_HFT_BASE_URL)
     client = UpstoxClient(cfg)
     try:
-        res = client.place_order_v2(req.upstox_body)
+        res = client.place_order_v2(upstox_body)
         data = res.get("data") if isinstance(res, dict) else None
         broker_order_id = None
         if isinstance(data, dict):
@@ -153,6 +195,8 @@ def place(req: OrderPlaceRequest, request: Request) -> dict:
 
 @router.post("/upstox/place-v3")
 def upstox_place_v3(body: dict[str, Any], request: Request) -> dict:
+    if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+        raise HTTPException(status_code=403, detail="LIVE_TRADING_ENABLED=false: live orders disabled")
     if settings.SAFE_MODE:
         raise HTTPException(status_code=403, detail="SAFE_MODE=true: live orders disabled")
     try:
@@ -175,6 +219,8 @@ def upstox_place_v3(body: dict[str, Any], request: Request) -> dict:
 
 @router.put("/upstox/modify-v3")
 def upstox_modify_v3(body: dict[str, Any], request: Request) -> dict:
+    if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+        raise HTTPException(status_code=403, detail="LIVE_TRADING_ENABLED=false: live orders disabled")
     if settings.SAFE_MODE:
         raise HTTPException(status_code=403, detail="SAFE_MODE=true: live orders disabled")
     try:
@@ -197,6 +243,8 @@ def upstox_modify_v3(body: dict[str, Any], request: Request) -> dict:
 
 @router.delete("/upstox/cancel-v3")
 def upstox_cancel_v3(order_id: str, request: Request) -> dict:
+    if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+        raise HTTPException(status_code=403, detail="LIVE_TRADING_ENABLED=false: live orders disabled")
     if settings.SAFE_MODE:
         raise HTTPException(status_code=403, detail="SAFE_MODE=true: live orders disabled")
     try:

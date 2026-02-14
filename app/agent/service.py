@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,7 @@ from app.core.settings import settings
 from app.markets.nse.calendar import load_market_session
 from app.ai.engine import AIEngine
 from app.ai.intraday_overlays import analyze_intraday
+from app.ai.trend_confluence import confluence_policy
 from app.candles.service import CandleService
 from app.paper_trading.service import PaperTradingService
 from app.portfolio.service import PortfolioService
@@ -47,6 +49,77 @@ class AgentStatus:
 
 
 class AutoTraderAgent:
+    def _ai_stop_target_plan(self, *, decision: str, entry: float, pred: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Compute SL/target using AI prediction info.
+
+        Uses predicted next-hour high/low when available, and scales base SL/TP
+        using confidence/uncertainty. Returns None if unavailable.
+        """
+
+        if entry <= 0 or not isinstance(pred, dict):
+            return None
+
+        p = pred.get("prediction")
+        if not isinstance(p, dict):
+            return None
+
+        ai_conf = float(p.get("confidence") or 0.0)
+        ai_unc = float(p.get("uncertainty") or 1.0)
+
+        base_sl = float(max(0.003, min(0.03, 0.004 + ai_unc * 0.02)))
+        base_tp = float(max(0.003, min(0.05, 0.005 + ai_conf * 0.03)))
+
+        ohlc = p.get("next_hour_ohlc")
+        ohlc = ohlc if isinstance(ohlc, dict) else {}
+        pred_high = float(ohlc.get("high") or 0.0)
+        pred_low = float(ohlc.get("low") or 0.0)
+
+        d = str(decision).upper()
+        if d not in {"BUY", "SELL"}:
+            return None
+
+        # Maintain minimum gap so stop/target remain meaningful.
+        min_gap = max(1e-9, float(entry) * 0.001)
+
+        if d == "BUY":
+            stop = float(entry * (1.0 - base_sl))
+            target = float(entry * (1.0 + base_tp))
+
+            if pred_low > 0 and pred_low < entry:
+                stop = float(min(stop, pred_low))
+            if pred_high > 0 and pred_high > entry:
+                target = float(max(target, pred_high))
+
+            stop = float(min(stop, entry - min_gap))
+            target = float(max(target, entry + min_gap))
+        else:
+            stop = float(entry * (1.0 + base_sl))
+            target = float(entry * (1.0 - base_tp))
+
+            if pred_high > 0 and pred_high > entry:
+                stop = float(max(stop, pred_high))
+            if pred_low > 0 and pred_low < entry:
+                target = float(min(target, pred_low))
+
+            stop = float(max(stop, entry + min_gap))
+            target = float(min(target, entry - min_gap))
+
+        if not (math.isfinite(stop) and math.isfinite(target)):
+            return None
+        if stop <= 0 or target <= 0:
+            return None
+
+        return {
+            "source": "ai",
+            "decision": d,
+            "entry": float(entry),
+            "stop": float(stop),
+            "target": float(target),
+            "confidence": float(ai_conf),
+            "uncertainty": float(ai_unc),
+            "predicted_ohlc": {"high": (pred_high or None), "low": (pred_low or None)},
+        }
+
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._status = AgentStatus(running=False, started_ts=None, last_cycle_ts=None, last_error=None)
@@ -67,6 +140,7 @@ class AutoTraderAgent:
             "broker": settings.AUTOTRADER_BROKER,
             "enabled": bool(settings.AUTOTRADER_ENABLED),
             "safe_mode": bool(settings.SAFE_MODE),
+            "live_trading_enabled": bool(getattr(settings, "LIVE_TRADING_ENABLED", False)),
         }
 
     async def preview(self, instrument_key: str) -> dict[str, Any]:
@@ -107,6 +181,18 @@ class AutoTraderAgent:
         else:
             decision = "HOLD"
 
+        trend_confluence: dict[str, Any] | None = None
+        if decision in {"BUY", "SELL"} and bool(getattr(settings, "AUTOTRADER_TREND_CONFLUENCE_ENABLED", False)):
+            try:
+                trend_confluence = self._ai.analyze_trend_confluence(instrument_key)
+                pol = confluence_policy(intended_action=decision, confluence=trend_confluence)
+                if pol.action == "HOLD":
+                    decision = "HOLD"
+                else:
+                    conf = float(max(0.0, min(0.99, conf * float(pol.risk_multiplier))))
+            except Exception:
+                trend_confluence = None
+
         # Strategy idea (intraday levels)
         series = self._candles.poll_intraday(instrument_key, interval="1m", lookback_minutes=60 * 6)
         if not series.candles:
@@ -114,11 +200,24 @@ class AutoTraderAgent:
         highs = [c.high for c in series.candles]
         lows = [c.low for c in series.candles]
         closes = [c.close for c in series.candles]
+        volumes = [getattr(c, "volume", 0.0) for c in series.candles]
         idea = None
         sizing = None
+        ai_risk_plan = None
         if closes:
-            idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes)
-            sizing = self._risk.position_size(capital=capital, entry=float(idea.entry), stop=float(idea.stop_loss), confidence=conf)
+            idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes, volumes=volumes)
+            entry = float(idea.entry)
+            stop = float(idea.stop_loss)
+
+            if bool(settings.AUTOTRADER_AI_RISK_PLAN_ENABLED) and decision in {"BUY", "SELL"}:
+                ai_risk_plan = self._ai_stop_target_plan(decision=decision, entry=entry, pred=intra_pred)
+                if isinstance(ai_risk_plan, dict):
+                    try:
+                        stop = float(ai_risk_plan.get("stop") or stop)
+                    except Exception:
+                        pass
+
+            sizing = self._risk.position_size(capital=capital, entry=entry, stop=stop, confidence=conf)
 
         out = {
             "ok": True,
@@ -130,6 +229,7 @@ class AutoTraderAgent:
             },
             "decision": decision,
             "confidence": conf,
+            "trend_confluence": trend_confluence,
             "strategy": None
             if idea is None
             else {
@@ -137,6 +237,7 @@ class AutoTraderAgent:
                 "entry": float(idea.entry),
                 "stop": float(idea.stop_loss),
                 "target": float(idea.target),
+                "ai_risk_plan": (ai_risk_plan if isinstance(ai_risk_plan, dict) else None),
             },
             "risk": sizing,
         }
@@ -150,6 +251,9 @@ class AutoTraderAgent:
             return {"ok": False, "detail": "AUTOTRADER_ENABLED=false"}
         if get_controls().agent_disabled:
             return {"ok": False, "detail": "agent_disabled=true (runtime override)"}
+
+        if settings.AUTOTRADER_BROKER == "upstox" and (not bool(getattr(settings, "LIVE_TRADING_ENABLED", False))):
+            return {"ok": False, "detail": "LIVE_TRADING_ENABLED=false: cannot start live autotrader"}
 
         if settings.AUTOTRADER_BROKER == "upstox" and settings.SAFE_MODE:
             return {"ok": False, "detail": "SAFE_MODE=true: cannot start live autotrader"}
@@ -172,6 +276,8 @@ class AutoTraderAgent:
 
     async def flatten(self) -> dict:
         # Always allow flatten in paper mode; in upstox mode require SAFE_MODE=false.
+        if settings.AUTOTRADER_BROKER == "upstox" and (not bool(getattr(settings, "LIVE_TRADING_ENABLED", False))):
+            return {"ok": False, "detail": "LIVE_TRADING_ENABLED=false: cannot flatten live broker positions"}
         if settings.AUTOTRADER_BROKER == "upstox" and settings.SAFE_MODE:
             return {"ok": False, "detail": "SAFE_MODE=true: cannot flatten live broker positions"}
         res = await self._square_off_open_trades(reason="manual_flatten")
@@ -181,6 +287,8 @@ class AutoTraderAgent:
     async def cancel_open_orders(self) -> dict:
         if settings.AUTOTRADER_BROKER != "upstox":
             return {"ok": False, "detail": "cancel-open-orders only supported for upstox broker"}
+        if not bool(getattr(settings, "LIVE_TRADING_ENABLED", False)):
+            return {"ok": False, "detail": "LIVE_TRADING_ENABLED=false: refusing to cancel live orders"}
         if settings.SAFE_MODE:
             return {"ok": False, "detail": "SAFE_MODE=true: refusing to cancel live orders"}
 
@@ -415,13 +523,24 @@ class AutoTraderAgent:
             highs = [c.high for c in series.candles]
             lows = [c.low for c in series.candles]
             closes = [c.close for c in series.candles]
+            volumes = [getattr(c, "volume", 0.0) for c in series.candles]
             if not closes:
                 continue
 
-            idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes)
+            idea = self._strategy.build_idea(symbol=instrument_key, highs=highs, lows=lows, closes=closes, volumes=volumes)
             entry = float(idea.entry)
             stop = float(idea.stop_loss)
             target = float(idea.target)
+
+            ai_risk_plan = None
+            if bool(settings.AUTOTRADER_AI_RISK_PLAN_ENABLED) and decision in {"BUY", "SELL"}:
+                try:
+                    ai_risk_plan = self._ai_stop_target_plan(decision=decision, entry=float(entry), pred=intra_pred)
+                    if isinstance(ai_risk_plan, dict):
+                        stop = float(ai_risk_plan.get("stop") or stop)
+                        target = float(ai_risk_plan.get("target") or target)
+                except Exception:
+                    ai_risk_plan = None
 
             # Optional: overlays-based gating and plan override.
             overlay = None
@@ -537,6 +656,32 @@ class AutoTraderAgent:
                 )
                 continue
 
+            # Optional: multi-timeframe confluence gate + risk scaling.
+            trend_confluence: dict[str, Any] | None = None
+            if decision in {"BUY", "SELL"} and bool(getattr(settings, "AUTOTRADER_TREND_CONFLUENCE_ENABLED", False)):
+                try:
+                    trend_confluence = self._ai.analyze_trend_confluence(instrument_key)
+                    pol = confluence_policy(intended_action=decision, confluence=trend_confluence)
+                    if pol.action == "HOLD":
+                        publish_sync(
+                            "agent",
+                            "agent.decision",
+                            {
+                                "cycle_ts": cycle_ts,
+                                "instrument_key": instrument_key,
+                                "decision": "HOLD",
+                                "confidence": conf,
+                                "signals": {"long": {"signal": long_sig, "confidence": long_conf}, "intraday": {"signal": intra_sig, "confidence": intra_conf}},
+                                "reason": "confluence_gate",
+                                "trend_confluence": trend_confluence,
+                                "policy": {"reason": pol.reason},
+                            },
+                        )
+                        continue
+                    conf = float(max(0.0, min(0.99, conf * float(pol.risk_multiplier))))
+                except Exception:
+                    trend_confluence = None
+
             sizing = self._risk.position_size(capital=capital, entry=entry, stop=stop, confidence=conf)
             qty = float(sizing.get("qty") or 0.0)
             if qty <= 0:
@@ -565,9 +710,10 @@ class AutoTraderAgent:
                     "decision": decision,
                     "confidence": conf,
                     "signals": {"long": {"signal": long_sig, "confidence": long_conf}, "intraday": {"signal": intra_sig, "confidence": intra_conf}},
-                    "strategy": {"entry": float(entry), "stop": float(stop), "target": float(target)},
+                    "strategy": {"entry": float(entry), "stop": float(stop), "target": float(target), "ai_risk_plan": (ai_risk_plan if isinstance(ai_risk_plan, dict) else None)},
                     "risk": sizing,
                     "capital": float(capital),
+                    "trend_confluence": trend_confluence,
                 },
             )
 
@@ -584,7 +730,12 @@ class AutoTraderAgent:
                     entry_order_id=None,
                     sl_order_id=None,
                     monitor_app_stop=True,
-                    meta={"mode": "paper", "overlays": (overlay if isinstance(overlay, dict) else None)},
+                    meta={
+                        "mode": "paper",
+                        "overlays": (overlay if isinstance(overlay, dict) else None),
+                        "ai_risk_plan": (ai_risk_plan if isinstance(ai_risk_plan, dict) else None),
+                        "trend_confluence": (trend_confluence if isinstance(trend_confluence, dict) else None),
+                    },
                 )
                 order_state_id = create_order(
                     broker="paper",
@@ -738,7 +889,13 @@ class AutoTraderAgent:
                     entry_order_id=entry_order_id,
                     sl_order_id=sl_order_id,
                     monitor_app_stop=monitor_app_stop,
-                    meta={"mode": "upstox", "signals": {"long": long_sig, "intraday": intra_sig}, "overlays": (overlay if isinstance(overlay, dict) else None)},
+                    meta={
+                        "mode": "upstox",
+                        "signals": {"long": long_sig, "intraday": intra_sig},
+                        "overlays": (overlay if isinstance(overlay, dict) else None),
+                        "ai_risk_plan": (ai_risk_plan if isinstance(ai_risk_plan, dict) else None),
+                        "trend_confluence": (trend_confluence if isinstance(trend_confluence, dict) else None),
+                    },
                 )
 
                 update_trade(

@@ -51,14 +51,20 @@ def perf_span(op: str, **tags: Any):
         rid = request_id_var.get() or "-"
         slow_ms = _slow_ms()
         should = _always_inner() or (dt_ms >= float(slow_ms))
-        if not should:
-            return
-
-        level = "WARNING" if dt_ms >= float(slow_ms) else "DEBUG"
-        status = "ok" if ok else "err"
-        # Keep tag payload compact.
-        extra = {k: v for k, v in tags.items() if v is not None}
-        logger.log(level, "PERF {op} {status}: {ms:.1f}ms rid={rid} tags={tags}", op=op, status=status, ms=dt_ms, rid=rid, tags=extra)
+        if should:
+            level = "WARNING" if dt_ms >= float(slow_ms) else "DEBUG"
+            status = "ok" if ok else "err"
+            # Keep tag payload compact.
+            extra = {k: v for k, v in tags.items() if v is not None}
+            logger.log(
+                level,
+                "PERF {op} {status}: {ms:.1f}ms rid={rid} tags={tags}",
+                op=op,
+                status=status,
+                ms=dt_ms,
+                rid=rid,
+                tags=extra,
+            )
 
 
 def timed(op: str | None = None, **fixed_tags: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
